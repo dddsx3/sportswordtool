@@ -21,7 +21,9 @@ impl Drop for FixtureDir {
     }
 }
 
-pub(super) fn mock_school(responses: Vec<(&'static str, Value)>) -> (String, std::thread::JoinHandle<usize>) {
+pub(super) fn mock_school(
+    responses: Vec<(&'static str, Value)>,
+) -> (String, std::thread::JoinHandle<usize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let host = format!("http://{}", listener.local_addr().unwrap());
@@ -312,7 +314,7 @@ fn malformed_fence_http_refresh_keeps_local_map_without_fabricating_preview() {
 }
 
 #[test]
-fn explicit_null_boundary_refreshes_points_and_repeats_one_road_loop() {
+fn explicit_null_boundary_refreshes_points_and_fills_open_route_to_target() {
     let root = FixtureDir::new();
     let live = vec![
         wire_point(39.9, 116.4),
@@ -361,9 +363,11 @@ fn explicit_null_boundary_refreshes_points_and_repeats_one_road_loop() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let preview = app.run_page.preview.as_ref().unwrap();
-    assert!(preview.length_m > 100. && preview.length_m < 500.);
+    // 开放补距路线：按序串联 + 末端路网补距直接长到目标（2.4km），
+    // 不再是「短闭环 + laps 显示绕 N 圈」的旧形态（小环 fixture 上必须绕圈时例外）
+    assert!(preview.length_m > 2300. && preview.length_m < 2600.);
     assert!((preview.laps.iter().sum::<f64>() - 2400.).abs() < 0.01);
-    assert!(preview.laps.len() >= 5);
+    assert!(!preview.laps.is_empty());
     assert_eq!(preview.checkpoints.len(), 5);
     assert!(preview.fences.is_empty());
     assert!(app.run_page.preview_status.contains("未提供学校边界"));

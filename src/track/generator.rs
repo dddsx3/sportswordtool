@@ -13,13 +13,18 @@ use super::geom::{
 use super::model::{GenPoint, Track};
 use super::postfix::apply_post_fixes;
 
-/// Limit generated measurement noise to a local neighborhood.
-pub const MAX_EXCEPTION_DRIFT_M: f64 = 6.0;
+/// GPS 瞬时速度尖峰上限的异常点低速口径（km/h）。
 pub const MAX_EXCEPTION_GPS_SPEED_KMH: f64 = 6.0;
 
 /// 有效配速窗口（m/s），保留原有生成器边界。
-pub const SPEED_FLOOR: f64 = 1.90;
+/// 下限对齐 NEUQ 真人均速 1.67 m/s（9'50"/km），留余量。
+pub const SPEED_FLOOR: f64 = 1.55;
 pub const SPEED_CEIL: f64 = 6.30;
+
+/// 丢星点（type=-1）位移模型（NEUQ 真人实测/XieRun 基线一致）：
+/// 42% 原地复制、50% 漂 0.6-20m、8% 漂 20-50m。
+pub const LOST_FIX_HOLD: f64 = 0.42;
+pub const LOST_FIX_NEAR: f64 = 0.50; // 其余为远漂（20-50m）
 
 /// 等比缩放逐点速度至目标总距：越界点钳在窗口边界，剩余差量由未饱和点分摊（迭代收敛）。
 /// 与整体等比缩放的区别：任何一点的瞬时配速都不会越出有效窗口。
@@ -61,10 +66,12 @@ pub fn build(
     let mut t = 0.0;
     while t < dur_f {
         times.push(t);
-        t += if rng.random() < 0.80 {
+        // 采样间隔对齐 NEUQ 真人（33 条实测）：主 5s ~88.5%，尾部 6s 主导、
+        // 4s 次之、7-9s 罕见（真机定位节流形态）
+        t += if rng.random() < 0.955 {
             5.0
         } else {
-            rng.choice(&[1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0])
+            rng.weighted(&[(4.0, 2), (6.0, 3), (9.0, 1)])
         };
     }
     let n = times.len();
@@ -119,37 +126,34 @@ pub fn build(
     fit_speeds(&mut w, &dts, dist);
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
 
-    let tl_w = [
-        ((-1i64, 4i64), 54u32),
-        ((-1, 1), 27),
-        ((-1, 12), 13),
-        ((-1, 5), 3),
-        ((-1, 6), 2),
-    ];
+    // 点位类型（NEUQ 33 条实测）：0 占 96.8%、2 占 2.0%、3 占 0.25%、-1 占 0.07%；
+    // 真人不存在 type 1/8；首点/idx1/末点哨兵由 postfix 处理。
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let u = rng.random();
-        if u < 0.39 {
+        if u < 0.0202 {
+            kinds.push((2, 1));
+        } else if u < 0.0227 {
             kinds.push((3, 1));
-        } else if u < 0.93 {
-            kinds.push((0, 1));
-        } else if u < 0.96 {
-            kinds.push(rng.weighted(&tl_w));
+        } else if u < 0.0234 {
+            kinds.push((-1, 1));
         } else {
-            kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
-        }
-    }
-    for i in 1..kinds.len() {
-        let prev_drift = (-1 == kinds[i - 1].0) || kinds[i - 1].0 == 5 || kinds[i - 1].0 == 6;
-        if kinds[i].0 != -1 && prev_drift && rng.random() < 0.08 {
-            kinds[i] = (if rng.random() < 0.75 { 7 } else { 8 }, 1);
+            kinds.push((0, 1));
         }
     }
     for i in 1..n {
         if kinds[i].0 == -1 && kinds[i - 1].0 == -1 {
-            kinds[i] = (rng.choice(&[3, 0]), 1);
+            kinds[i] = (0, 1);
         }
     }
+    // 逐次运行的 GPS 质量（真人：个别run整体走 WiFi/基站定位，其余基本全 GPS）。
+    let state2_rate = if rng.random() < 0.06 {
+        rng.uniform(0.60, 0.95)
+    } else {
+        rng.uniform(0.0, 0.02)
+    };
+    // 设备精度指纹（真人 radius 98% 恒定，罕见离群到 56m）。
+    let radius_base = crate::api::model::device_profile().radius_base;
     let normal_idx: Vec<usize> = (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
     let share: f64 = normal_idx.iter().map(|&i| seg_dist[i]).sum();
     let share = if share == 0.0 { 1.0 } else { share };
@@ -165,9 +169,23 @@ pub fn build(
     let mut steps_acc = 0.0f64;
     let mut jx = 0.0f64;
     let mut jy = 0.0f64;
-    let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
-    let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
+    // 海拔：AR(1) 过程（NEUQ 真人 φ 中位 0.93、ε σ 中位 1.29m，起点 0-40m 沿海场地）
+    let flat_run = rng.random() < 0.2;
+    let mut alt = rng.uniform(-1.0, 25.0);
+    let alt_base = alt;
+    let alt_phi = rng.uniform(0.85, 0.97);
+    let alt_sigma = if flat_run {
+        0.05
+    } else {
+        rng.uniform(0.9, 2.6)
+    };
+    // 卫星数：真机为持续过程（lag-1 自相关 0.64-0.84），非逐点独立
+    let mut count_next = (38.0 + rng.gauss(0.0, 6.0)).round().clamp(0.0, 80.0) as i64;
+    // bdS 每 run 比例（SDK 速度换算系数因设备而异）
+    let bds_ratio = rng.uniform(0.55, 0.8);
+    // 网络定位 episode（劣 GPS run 的 radius 恒定 9-11m 连续段）
+    let episode_radius = rng.uniform(9.0, 11.0);
+    let radius_variable = rng.random() < 0.4;
     for i in 0..n {
         let dt = dts[i];
         let (typ, lt) = kinds[i];
@@ -190,22 +208,33 @@ pub fn build(
             jy = 0.72 * jy + rng.gauss(0.0, 0.75);
             px = bx + jx;
             py = by + jy;
-            rad = round_to(
-                if typ == 3 {
-                    rng.uniform(1.4, 5.1)
-                } else {
-                    rng.uniform(1.4, 2.4)
-                },
-                2,
-            );
-            state = if typ == 0 {
-                rng.weighted(&[(1, 145), (2, 45), (3, 164)])
+            // 设备精度指纹：98% 恒定基准，罕见离群（真人 3.79 → 最长 56m）
+            // radius 每 run 风格：60% 近恒定（个别机型），40% 变化型
+            // （真机 accuracy std 2.8-7.0m，1/2/6/7 位小数混合）
+            rad = if state2_rate > 0.5 {
+                episode_radius * (1.0 + rng.gauss(0.0, 0.08))
+            } else if radius_variable {
+                ((rng.uniform(2.2, 30.0).powf(1.35)) * 1e6).round() / 1e6
+            } else if rng.random() < 0.9 {
+                radius_base * (1.0 + rng.gauss(0.0, 0.05))
             } else {
-                rng.weighted(&[(1, 145), (2, 256), (3, 151)])
+                ((rng.uniform(8.0, 56.0)) * 1e7).round() / 1e7
+            };
+            state = if rng.random() < state2_rate {
+                2
+            } else if state2_rate > 0.5 && rng.random() < 0.04 {
+                3
+            } else {
+                1
             };
         } else {
-            if rng.random() >= 0.20 {
-                d_step = rng.uniform(0.0, super::generator::MAX_EXCEPTION_DRIFT_M);
+            let u = rng.random();
+            if u < LOST_FIX_HOLD {
+                d_step = 0.0;
+            } else if u < LOST_FIX_HOLD + LOST_FIX_NEAR {
+                d_step = rng.uniform(0.6, 20.0);
+            } else {
+                d_step = rng.uniform(20.0, 50.0);
             }
             let (bx, by) = pos(s);
             x = bx;
@@ -222,14 +251,14 @@ pub fn build(
                 px = x + jx;
                 py = y + jy;
             }
-            rad = round_to(rng.uniform(1.6, 10.0), 2);
-            state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
+            rad = ((rng.uniform(8.0, 56.0)) * 1e7).round() / 1e7;
+            state = rng.weighted(&[(1, 30), (2, 60), (3, 10)]);
         }
         if typ != -1 {
             dist_acc += d_step; // 异常点漂移不计入累计距离
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
+        alt = alt_phi * alt + (1.0 - alt_phi) * alt_base + rng.gauss(0.0, alt_sigma);
         let v_now = dist / dur_f;
         let stride_target = 0.62
             + 0.17 * v_now
@@ -240,9 +269,9 @@ pub fn build(
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + direction * 2.0);
         let brg =
-            ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
+            ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 14.0)).rem_euclid(360.0);
         // 异常点（-1）：avgSpeed 为累计均值（真人与此一致，不为 0）；
-        // GPS 瞬时速度限制在低速范围，避免额外制造尖峰
+        // GPS 瞬时速度为多普勒口径：真人均值的 1.15-1.7 倍，偶发 0 与尖峰毛刺
         let (avg_sp, gps_speed) = if typ == -1 {
             let avg = round_to(dist_acc / t_acc.max(1.0), 4);
             let gps = rng.uniform(0.5, super::generator::MAX_EXCEPTION_GPS_SPEED_KMH);
@@ -250,13 +279,20 @@ pub fn build(
         } else {
             let avg = round_to(d_step / dt, 4);
             let kmh = avg * 3.6;
-            let sigma = (kmh * 0.08).max(0.05);
-            let gps = if rng.random() < 0.20 {
+            // 真机毛刺两级化（真人分布）：小毛刺 ~30-120 km/h 常见，
+            // 灾难值 1000-8500 km/h 罕见（每 run 至多一两个）
+            let r = rng.random();
+            let gps = if r < 0.004 {
                 0.0
+            } else if r < 0.012 {
+                rng.uniform(30.0, 120.0)
+            } else if r < 0.014 {
+                rng.uniform(1000.0, 8500.0)
             } else {
-                round_to((kmh + rng.gauss(0.0, sigma)).max(0.0), 4)
+                // 与位移同源：均值 = 位移速率，乘性噪声保持相关性
+                (kmh * (1.0 + rng.gauss(0.0, 0.18))).max(0.0)
             };
-            (avg, gps)
+            (avg, round_to(gps, 2))
         };
 
         locs.push(GenPoint {
@@ -266,7 +302,7 @@ pub fn build(
             lng: -1.0,
             gLat: round_to(lat, 7),
             gLng: round_to(lng, 7),
-            speed: round_to(gps_speed, 4),
+            speed: round_to(gps_speed, 2),
             avgSpeed: avg_sp,
             radius: rad,
             accuracy: rad,
@@ -274,8 +310,9 @@ pub fn build(
             locType: lt,
             hasAltitude: true,
             totalTime: round_to(t_acc, 0) as i64,
-            totalDis: round_to(dist_acc, 4),
-            validDis: round_to(dist_acc, 4),
+            // 全精度累计距离（真人 totalDis 为原始 double 累计值）
+            totalDis: dist_acc,
+            validDis: dist_acc,
             validTime: round_to(t_acc, 0) as i64,
             steps: steps_acc as i64,
             stepDistance: 0.0,
@@ -284,14 +321,20 @@ pub fn build(
             queueNum: 0,
             coorType: "gcj02".into(),
             bdA: round_to(alt, 2),
-            bdD: round_to(brg, 2),
-            bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
-            bdG: rng.choice(&[1, 1, 1, -1]),
-            count: rng.randint(20, 88),
+            bdD: round_to(brg, 1),
+            bdS: round_to(
+                (avg_sp * bds_ratio * (1.0 + rng.gauss(0.0, 0.08))).max(0.0),
+                2,
+            ),
+            bdG: 1,
+            count: count_next,
             dtr: 0.0,
             state,
             locationId: String::new(),
         });
+        count_next = (count_next as f64 * 0.75 + 38.0 * 0.25 + rng.gauss(0.0, 5.0))
+            .round()
+            .clamp(0.0, 80.0) as i64;
     }
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
@@ -329,6 +372,10 @@ pub fn build(
         speedPerTenSec: Vec::new(),
         stepsPerTenSec: Vec::new(),
         segments: Vec::new(),
+        id_base: 1,
+        window_id_base: 1,
+        window_t0_ms: 0,
+        five_point_id_base: 1,
     };
     super::stats::rebuild(&mut track);
     track

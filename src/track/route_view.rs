@@ -1,7 +1,12 @@
 use route_planner::Route;
 /// Laps are returns to the route start; a final partial lap is retained.
 pub fn laps(route: &Route, target: f64) -> Vec<f64> {
-    if route.length_m <= 0. || target <= 0. {
+    if route.points.is_empty()
+        || !route.length_m.is_finite()
+        || route.length_m <= 0.
+        || !target.is_finite()
+        || target <= 0.
+    {
         return Vec::new();
     }
     let start = route.points[0];
@@ -27,7 +32,12 @@ pub fn laps(route: &Route, target: f64) -> Vec<f64> {
 }
 pub fn position(points: &[(f64, f64)], arcs: &[f64], distance: f64) -> Option<(f64, f64)> {
     let total = *arcs.last()?;
-    if total <= 0. || points.len() != arcs.len() {
+    if arcs.len() < 2
+        || !total.is_finite()
+        || total <= 0.
+        || !distance.is_finite()
+        || points.len() != arcs.len()
+    {
         return None;
     }
     let s = distance.rem_euclid(total);
@@ -69,6 +79,32 @@ mod tests {
         assert_eq!(
             super::position(&[(0., 0.), (1., 1.), (0., 0.)], &[0., 50., 100.], 125.),
             Some((0.5, 0.5))
+        );
+    }
+
+    #[test]
+    fn empty_route_and_non_finite_target_are_safe() {
+        let empty = route_planner::Route {
+            length_m: 100.,
+            points: Vec::new(),
+        };
+        assert!(super::laps(&empty, 250.).is_empty());
+
+        let one_point = route_planner::Route {
+            length_m: 100.,
+            points: vec![route_planner::RoutePoint {
+                lat: 0.,
+                lon: 0.,
+                s: 0.,
+                curvature: 0.,
+            }],
+        };
+        assert!(super::laps(&one_point, f64::INFINITY).is_empty());
+        assert!(super::laps(&one_point, f64::NAN).is_empty());
+        assert_eq!(super::position(&[(0., 0.)], &[0.], 1.), None);
+        assert_eq!(
+            super::position(&[(0., 0.), (1., 1.)], &[0., 1.], f64::NAN),
+            None
         );
     }
 }

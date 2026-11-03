@@ -26,6 +26,7 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
         sp.state = 1;
         sp.locType = 1;
         sp.radius = round_to(rng.uniform(2.0, 3.5), 2);
+        sp.bdD = 0.0;
         sp.speed = 0.0;
         sp.avgSpeed = 0.0;
         sp.bdS = 0.0;
@@ -40,23 +41,10 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
         e.ptype = 6;
         e.locType = 1;
         e.radius = round_to(rng.uniform(1.5, 3.0), 2);
-        // 后半段散布 type=1/2/8（67-99% 行程区间；type=8 真人低频出现）
-        let from = (locs.len() as f64 * 0.67) as usize;
-        for i in from..locs.len().saturating_sub(2) {
-            if locs[i].ptype != -1 && rng.random() < 0.06 {
-                locs[i].ptype = rng.choice(&[1, 1, 2, 8]);
-                locs[i].locType = 1;
-            }
-        }
     }
-    // 边界修正①：索引2 首个真实点 avgSpeed 不跨哨兵计算，并保持在有效窗口内
-    if locs.len() > 3 && locs[2].ptype != -1 {
-        let p2 = &mut locs[2];
-        p2.avgSpeed = round_to(p2.totalDis / 1.0f64.max(p2.totalTime as f64), 4).clamp(
-            crate::track::generator::SPEED_FLOOR,
-            crate::track::generator::SPEED_CEIL,
-        );
-        p2.speed = round_to(p2.avgSpeed * 3.6, 4);
+    // 边界修正①：索引2 avgSpeed 由 rederive EMA 覆盖，此处仅确保非零
+    if locs.len() > 3 && locs[2].ptype != -1 && locs[2].avgSpeed < 0.1 {
+        locs[2].avgSpeed = 1.5;
     }
     // 首点 = 起点：totalTime=0、type∈{0,7}、速度取首个非零值
     if !locs.is_empty() {
@@ -80,8 +68,19 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
             locs[0].speed = round_to(rng.uniform(7.0, 13.0), 4);
         }
     }
-    for p in locs.iter_mut() {
-        p.gainTimeMs = start_ms + p.totalTime * 1000;
+    // 真机 gainTime 是打点时钟：漂移恒定，偶发 ±3-17s 校正
+    // （ΔgainTime ≡ ΔtotalTime 占 82-99%）
+    let n_pts = locs.len();
+    let mut drift_s = rng.uniform(0.5, 6.5);
+    for (idx, p) in locs.iter_mut().enumerate() {
+        if idx > 0 && rng.random() < 0.03 {
+            drift_s = (drift_s + rng.uniform(-17.0, 17.0)).clamp(0.0, 37.0);
+        }
+        let remain = n_pts - idx;
+        if remain <= 3 {
+            drift_s *= 0.4;
+        }
+        p.gainTimeMs = start_ms + p.totalTime * 1000 + (drift_s * 1000.0) as i64;
         p.gainTime = super::geom::fmt_gain_time(p.gainTimeMs);
     }
 }

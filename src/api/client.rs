@@ -79,9 +79,14 @@ impl ApiClient {
         if is_session_expired(&error) {
             self.auth_rejected = true;
             if let (Some(context), Some(session)) = (&self.auth_context, &self.login) {
-                if !context.rejected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if !context
+                    .rejected
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
                     let _ = context.notify.send(AuthFailure {
-                        epoch: context.epoch, uid: session.uid, token: session.token.clone(),
+                        epoch: context.epoch,
+                        uid: session.uid,
+                        token: session.token.clone(),
                     });
                 }
             }
@@ -91,7 +96,12 @@ impl ApiClient {
 
     pub(crate) fn ensure_session_valid(&self) -> Result<(), String> {
         if self.login.as_ref().is_some_and(Session::is_logged_in)
-            && (self.auth_rejected || self.auth_context.as_ref().is_some_and(|c| c.rejected.load(std::sync::atomic::Ordering::SeqCst))) {
+            && (self.auth_rejected
+                || self
+                    .auth_context
+                    .as_ref()
+                    .is_some_and(|c| c.rejected.load(std::sync::atomic::Ordering::SeqCst)))
+        {
             return Err(SESSION_EXPIRED.into());
         }
         Ok(())
@@ -100,7 +110,11 @@ impl ApiClient {
     pub(crate) fn record_url(&self) -> String {
         #[cfg(test)]
         if let Some(host) = &self.test_host {
-            return format!("{}{}", host.trim_end_matches('/'), super::submit::RECORD_PATH);
+            return format!(
+                "{}{}",
+                host.trim_end_matches('/'),
+                super::submit::RECORD_PATH
+            );
         }
         format!("{}{}", super::model::HOST, super::submit::RECORD_PATH)
     }
@@ -110,7 +124,10 @@ impl ApiClient {
     }
 
     fn token(&self) -> String {
-        self.login.as_ref().map(|s| s.token.clone()).unwrap_or_default()
+        self.login
+            .as_ref()
+            .map(|s| s.token.clone())
+            .unwrap_or_default()
     }
 
     /// 发送信封请求（header/headerSign 用 observed 序，body 用 insert 序）。
@@ -129,13 +146,20 @@ impl ApiClient {
         let (header_plain, _) = build_header_for(&self.identity, uid, &token, None);
         let header_env = build_envelope(&mut self.session, &header_plain, OuterOrder::Observed);
         // body 时间戳 = header ts + 1（原生两次独立读取毫秒）
-        let body_env =
-            build_envelope_ts(&mut self.session, body_plain, OuterOrder::Insert, header_env.ts_ms + 1);
+        let body_env = build_envelope_ts(
+            &mut self.session,
+            body_plain,
+            OuterOrder::Insert,
+            header_env.ts_ms + 1,
+        );
 
         #[cfg(test)]
         let test_url = self.test_host.as_ref().map(|host| {
             let authority_and_path = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-            let path = authority_and_path.find('/').map(|at| &authority_and_path[at..]).unwrap_or("/");
+            let path = authority_and_path
+                .find('/')
+                .map(|at| &authority_and_path[at..])
+                .unwrap_or("/");
             format!("{}{path}", host.trim_end_matches('/'))
         });
         #[cfg(test)]
@@ -148,7 +172,8 @@ impl ApiClient {
         for (k, v) in extra_headers {
             req = req.set(k, v);
         }
-        let resp = req.send_string(&body_env.json)
+        let resp = req
+            .send_string(&body_env.json)
             .map_err(|e| self.handle_request_error(e))?;
         let status = resp.status();
         let raw = resp.into_string().unwrap_or_default();
@@ -159,11 +184,20 @@ impl ApiClient {
             &body_env.key_data[2],
             &body_env.key_data[3],
         );
-        let (decrypted, raw_head) = match decrypt_response(raw.as_bytes(), &key, &rsa_public_key()) {
+        let (decrypted, raw_head) = match decrypt_response(raw.as_bytes(), &key, &rsa_public_key())
+        {
             Ok(d) => (Some(d), String::new()),
-            Err(e) => (None, format!("{e} | 原文: {}", crate::textlog::truncate(&raw, 160))),
+            Err(e) => (
+                None,
+                format!("{e} | 原文: {}", crate::textlog::truncate(&raw, 160)),
+            ),
         };
-        Ok(RequestOutcome { http_status: status, decrypted, raw_len, raw_head })
+        Ok(RequestOutcome {
+            http_status: status,
+            decrypted,
+            raw_len,
+            raw_head,
+        })
     }
 
     /// 标准业务请求（RUN 域名）：返回业务 JSON；error != 10000 时 Err。
@@ -174,7 +208,13 @@ impl ApiClient {
         body_plain: &str,
         extra_headers: &[(String, String)],
     ) -> Result<serde_json::Value, String> {
-        self.call_host(crate::api::model::HOST, method, path, body_plain, extra_headers)
+        self.call_host(
+            crate::api::model::HOST,
+            method,
+            path,
+            body_plain,
+            extra_headers,
+        )
     }
 
     /// 指定域名业务请求（排行榜/违规名单走 DISCOVERY，信封链相同）。
@@ -202,8 +242,12 @@ impl ApiClient {
                 return Err(e);
             }
         };
-        let biz_str = serde_json::to_string(&crate::textlog::redact_json(&business)).unwrap_or_default();
-        eprintln!("[resp] {} -> {} ({}B) {}", path, out.http_status, out.raw_len, biz_str);
+        let biz_str =
+            serde_json::to_string(&crate::textlog::redact_json(&business)).unwrap_or_default();
+        eprintln!(
+            "[resp] {} -> {} ({}B) {}",
+            path, out.http_status, out.raw_len, biz_str
+        );
         Ok(business)
     }
 }
@@ -233,8 +277,8 @@ pub(crate) fn normalize_business_data(v: &serde_json::Value) -> Result<serde_jso
             if text.len() > 8 * 1024 * 1024 {
                 return Err("业务 data JSON 超过 8 MiB".into());
             }
-            normalized["data"] = serde_json::from_str(text)
-                .map_err(|_| "业务 data JSON 格式无效".to_string())?;
+            normalized["data"] =
+                serde_json::from_str(text).map_err(|_| "业务 data JSON 格式无效".to_string())?;
         }
     }
     Ok(normalized)
@@ -253,7 +297,9 @@ pub fn get_field<'a>(biz: &'a serde_json::Value, name: &str) -> Option<&'a serde
 /// data 字段如果是 JSON 字符串则解析（Obs 一层包裹语义）。
 pub fn parse_data_field(biz: &serde_json::Value) -> serde_json::Value {
     match biz.get("data") {
-        Some(serde_json::Value::String(s)) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+        Some(serde_json::Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+        }
         Some(v) => v.clone(),
         None => serde_json::Value::Null,
     }
@@ -268,7 +314,6 @@ pub fn ureq_err(e: ureq::Error) -> String {
         ureq::Error::Transport(t) => format!("网络错误: {t}"),
     }
 }
-
 
 pub const SESSION_EXPIRED: &str = "登录已失效（HTTP 401）：请重新登录获取有效凭证";
 
@@ -296,7 +341,10 @@ mod business_data_tests {
         for data in [json!({"geoFences":[],"runAreaId":42}), json!([{"id":1}])] {
             let object = json!({"error":10000,"data":data});
             let encoded = json!({"error":10000,"data":data.to_string()});
-            assert_eq!(check_business(&encoded).unwrap(), check_business(&object).unwrap());
+            assert_eq!(
+                check_business(&encoded).unwrap(),
+                check_business(&object).unwrap()
+            );
         }
         for data in ["操作成功", "https://example.invalid/file", "null", "42", ""] {
             let response = json!({"error":10000,"data":data});
@@ -306,12 +354,17 @@ mod business_data_tests {
 
     #[test]
     fn invalid_or_excessive_json_text_is_not_silently_empty() {
-        for data in ["{broken-private-payload".to_string(), format!("[\"{}\"]", "x".repeat(8 * 1024 * 1024))] {
+        for data in [
+            "{broken-private-payload".to_string(),
+            format!("[\"{}\"]", "x".repeat(8 * 1024 * 1024)),
+        ] {
             let error = check_business(&json!({"error":10000,"data":data})).unwrap_err();
             assert!(error.contains("data JSON"));
             assert!(!error.contains("private-payload"));
         }
-        assert!(check_business(&json!({"error":10603,"data":"{broken"})).unwrap_err().starts_with("业务错误 10603"));
+        assert!(check_business(&json!({"error":10603,"data":"{broken"}))
+            .unwrap_err()
+            .starts_with("业务错误 10603"));
     }
 }
 
@@ -323,16 +376,28 @@ mod auth_tests {
     }
     #[test]
     fn authenticated_401_requires_login_without_exposing_raw_response() {
-        let error = request_error(response_error(401, r#"{"message":"token有误或缓存中token不存在","token":"secret-fixture"}"#), true);
+        let error = request_error(
+            response_error(
+                401,
+                r#"{"message":"token有误或缓存中token不存在","token":"secret-fixture"}"#,
+            ),
+            true,
+        );
         assert_eq!(error, SESSION_EXPIRED);
         assert!(is_session_expired(&error));
         assert!(!error.contains("secret-fixture"));
     }
     #[test]
     fn login_and_non_auth_http_failures_do_not_expire_a_session() {
-        assert!(!is_session_expired(&request_error(response_error(401, "login rejected"), false)));
+        assert!(!is_session_expired(&request_error(
+            response_error(401, "login rejected"),
+            false
+        )));
         for code in [403, 429, 500] {
-            assert!(!is_session_expired(&request_error(response_error(code, "fixture"), true)));
+            assert!(!is_session_expired(&request_error(
+                response_error(code, "fixture"),
+                true
+            )));
         }
     }
     #[test]
@@ -343,16 +408,24 @@ mod auth_tests {
     }
 }
 
-
 #[cfg(test)]
 mod shared_auth_tests {
     use super::*;
     #[test]
     fn one_rejection_stops_other_school_reads_and_only_notifies_once() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let context = AuthContext { epoch: 7, rejected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), notify: tx };
-        let session = Session { uid: 42, token: "test-token".into(), ..Default::default() };
-        let mut first = ApiClient::new(HeaderIdentity::default(), Some(session.clone())).with_auth_context(Some(context.clone()));
+        let context = AuthContext {
+            epoch: 7,
+            rejected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notify: tx,
+        };
+        let session = Session {
+            uid: 42,
+            token: "test-token".into(),
+            ..Default::default()
+        };
+        let mut first = ApiClient::new(HeaderIdentity::default(), Some(session.clone()))
+            .with_auth_context(Some(context.clone()));
         // Exercise the actual request/error path using an isolated loopback HTTP server.
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -361,39 +434,77 @@ mod shared_auth_tests {
         let server = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut stream = loop {
-                if let Ok((stream, _)) = listener.accept() { break stream; }
-                assert!(std::time::Instant::now() < deadline, "mock HTTP request did not arrive");
+                if let Ok((stream, _)) = listener.accept() {
+                    break stream;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mock HTTP request did not arrive"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             };
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let header_end = loop {
                 let mut chunk = [0u8; 4096];
                 let n = stream.read(&mut chunk).unwrap();
                 assert!(n > 0);
                 request.extend_from_slice(&chunk[..n]);
-                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") { break at + 4; }
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
             };
             let headers = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
             assert!(headers.contains("headersign:"));
-            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
             while request.len() < header_end + length {
                 let mut chunk = [0u8; 4096];
                 let n = stream.read(&mut chunk).unwrap();
-                assert!(n > 0); request.extend_from_slice(&chunk[..n]);
+                assert!(n > 0);
+                request.extend_from_slice(&chunk[..n]);
             }
             let body = r#"{"status":401,"message":"token有误或缓存中token不存在"}"#;
-            write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
         });
-        assert_eq!(first.call_host(&host, "POST", crate::api::fence::FENCE_PATH, "{}", &[]).unwrap_err(), SESSION_EXPIRED);
+        assert_eq!(
+            first
+                .call_host(&host, "POST", crate::api::fence::FENCE_PATH, "{}", &[])
+                .unwrap_err(),
+            SESSION_EXPIRED
+        );
         server.join().unwrap();
         let failure = rx.try_recv().unwrap();
         assert_eq!(failure.epoch, 7);
         assert_eq!(failure.uid, 42);
-        for path in [crate::api::fence::FENCE_PATH, crate::api::cheat::CHEATLIST_PATH, "/api/v70230/runnings/records", crate::api::user::HOME_PAGE_INFO_PATH] {
-            let mut client = ApiClient::new(HeaderIdentity::default(), Some(session.clone())).with_auth_context(Some(context.clone()));
+        for path in [
+            crate::api::fence::FENCE_PATH,
+            crate::api::cheat::CHEATLIST_PATH,
+            "/api/v70230/runnings/records",
+            crate::api::user::HOME_PAGE_INFO_PATH,
+        ] {
+            let mut client = ApiClient::new(HeaderIdentity::default(), Some(session.clone()))
+                .with_auth_context(Some(context.clone()));
             // Rejection must happen before contacting this unreachable loopback address.
-            assert_eq!(client.call_host("http://127.0.0.1:1", "POST", path, "{}", &[]).unwrap_err(), SESSION_EXPIRED);
+            assert_eq!(
+                client
+                    .call_host("http://127.0.0.1:1", "POST", path, "{}", &[])
+                    .unwrap_err(),
+                SESSION_EXPIRED
+            );
         }
         assert!(rx.try_recv().is_err());
     }

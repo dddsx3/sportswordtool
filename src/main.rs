@@ -10,13 +10,39 @@ fn main() {
         run_gui();
         #[cfg(not(feature = "gui"))]
         {
-            eprintln!("当前为 CLI 构建，子命令用法：nekosportsworldtool help");
+            eprintln!("当前为 CLI 构建（无 GUI）。");
+            eprintln!("用法：nekosportsworldtool <子命令> [参数]");
+            eprintln!("查看全部命令：nekosportsworldtool help");
+            // 双击 exe 时 Windows 会新建一个只属于本进程的控制台，
+            // 打印完立即退出会表现为“闪退”；此时等待回车，方便阅读提示。
+            if console_owned_by_this_process() {
+                eprintln!("\n按回车键退出…");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            }
             std::process::exit(1);
         }
     } else {
         let code = cli::main(args);
         std::process::exit(code);
     }
+}
+
+/// 控制台是否只挂着当前进程（即由双击新建，而非从已有终端启动）。
+#[cfg(all(windows, not(feature = "gui")))]
+fn console_owned_by_this_process() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
+    }
+    let mut pids = [0u32; 2];
+    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    count == 1
+}
+
+#[cfg(all(not(windows), not(feature = "gui")))]
+fn console_owned_by_this_process() -> bool {
+    false
 }
 
 #[cfg(all(windows, feature = "gui"))]
@@ -30,7 +56,7 @@ fn free_console() {
     }
 }
 
-#[cfg(not(all(windows, feature = "gui")))]
+#[cfg(all(not(windows), feature = "gui"))]
 fn free_console() {}
 
 #[cfg(feature = "gui")]

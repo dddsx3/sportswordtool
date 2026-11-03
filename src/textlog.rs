@@ -56,18 +56,27 @@ pub fn redact_json(v: &serde_json::Value) -> serde_json::Value {
     const SENSITIVE_KEYS: &[&str] = &[
         "token",
         "password",
-        "passToken",
-        "access_token",
-        "refresh_token",
+        "passwd",
+        "pwd",
+        "passtoken",
+        "accesstoken",
+        "refreshtoken",
         "authorization",
         "secret",
     ];
+    fn normalized_key(key: &str) -> String {
+        key.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
     match v {
         Value::Object(obj) => Value::Object(
             obj.iter()
                 .map(|(key, value)| {
+                    let normalized = normalized_key(key);
                     let redacted = match value.as_str() {
-                        Some(s) if SENSITIVE_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k)) => {
+                        Some(s) if SENSITIVE_KEYS.iter().any(|k| normalized == *k) => {
                             Value::String(mask(s))
                         }
                         _ => redact_json(value),
@@ -108,7 +117,12 @@ mod tests {
             "PASSWORD",
             "PassToken",
             "ACCESS_TOKEN",
+            "accessToken",
+            "access-token",
             "refresh_token",
+            "refreshToken",
+            "passwd",
+            "PWD",
             "Authorization",
             "secret",
         ] {

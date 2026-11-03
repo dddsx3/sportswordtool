@@ -3,9 +3,9 @@
 #![allow(non_snake_case)]
 
 use crate::location::Coordinate;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GenPoint {
     pub id: i64,
     pub flag: i64,
@@ -16,18 +16,22 @@ pub struct GenPoint {
     pub speed: f64,
     pub avgSpeed: f64,
     pub radius: f64,
+    #[serde(default)]
     pub accuracy: f64,
     #[serde(rename = "type")]
     pub ptype: i64,
     pub locType: i64,
+    #[serde(default)]
     pub hasAltitude: bool,
     pub totalTime: i64,
     pub totalDis: f64,
     pub validDis: f64,
     pub validTime: i64,
+    #[serde(default)]
     pub steps: i64,
     pub stepDistance: f64,
     pub gainTime: String,
+    #[serde(default)]
     pub gainTimeMs: i64,
     pub queueNum: i64,
     pub coorType: String,
@@ -43,6 +47,7 @@ pub struct GenPoint {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct TenWindow {
+    /// 窗口时长（毫秒）。真人窗口由采样点 dt 网格累计而来，9.3-12s 不等。
     pub time: i64,
     pub value: f64,
 }
@@ -50,7 +55,7 @@ pub struct TenWindow {
 #[derive(Serialize, Clone, Debug)]
 pub struct Segment {
     pub totalTime: i64,
-    pub distance: i64,
+    pub distance: f64,
     pub startTime: i64,
     pub endTime: i64,
     pub avgSpeed: f64,
@@ -72,6 +77,15 @@ pub struct Track {
     pub speedPerTenSec: Vec<TenWindow>,
     pub stepsPerTenSec: Vec<TenWindow>,
     pub segments: Vec<Segment>,
+    /// 点 id 起始值：真人设备是跨次运行递增的计数器（NEUQ 实测 1~15944，中位 12031）。
+    /// 生成后由调用方（flow / track-sample）用设备计数器填入。
+    pub id_base: i64,
+    /// 10s 窗 id 起始值（同一设备计数器，NEUQ 实测 1~7220）。
+    pub window_id_base: i64,
+    /// 首窗起点相对 flag 的偏移（真人 1.5-3s：窗口从首个采样点起算）。
+    pub window_t0_ms: i64,
+    /// 五点载荷点位 id 基准（真机 App 内部点表计数器，NEUQ 实测 346..）。
+    pub five_point_id_base: i64,
 }
 
 impl Track {
@@ -109,16 +123,33 @@ impl Track {
                 return Err("轨迹累计统计无效".into());
             }
         }
-        for pair in self.locations.windows(2) {
+        for (i, pair) in self.locations.windows(2).enumerate() {
             let (a, b) = (&pair[0], &pair[1]);
+            // 真机语义：起点哨兵(type=5)携带全零累计，允许 p0→p1 的
+            // totalDis/validDis 归零（真人 p0.totalDis 中位 1.6m → p1 = 0）
+            let sentinel_reset = b.ptype == 5 && b.totalDis == 0.0 && b.validDis == 0.0;
             if b.totalTime < a.totalTime
-                || b.totalDis < a.totalDis
                 || b.steps < a.steps
-                || b.validDis < a.validDis
                 || b.validTime < a.validTime
+                || (!sentinel_reset && (b.totalDis < a.totalDis || b.validDis < a.validDis))
             {
+                #[cfg(not(test))]
+                eprintln!(
+                    "[validate] 倒退@{i}: td {}->{} vd {}->{} tt {}->{} steps {}->{} ptype {}->{}",
+                    a.totalDis,
+                    b.totalDis,
+                    a.validDis,
+                    b.validDis,
+                    a.totalTime,
+                    b.totalTime,
+                    a.steps,
+                    b.steps,
+                    a.ptype,
+                    b.ptype
+                );
                 return Err("轨迹累计统计发生倒退".into());
             }
+            let _ = i;
         }
         let last = self.locations.last().ok_or("轨迹不能为空")?;
         if self.totalTime != last.totalTime
@@ -186,6 +217,10 @@ mod tests {
             speedPerTenSec: vec![],
             stepsPerTenSec: vec![],
             segments: vec![],
+            id_base: 1,
+            window_id_base: 1,
+            window_t0_ms: 0,
+            five_point_id_base: 1,
         }
     }
     #[test]

@@ -27,11 +27,19 @@ pub fn parse_spec(text: &str) -> Result<Option<AltitudeSpec>, String> {
         return Ok(None);
     }
     if let Some((left, right)) = text.split_once('-') {
-        let min_m = left.trim().parse::<f64>().map_err(|_| "手动海拔区间格式应为 min-max，例如 11.6-22.8".to_string())?;
-        let max_m = right.trim().parse::<f64>().map_err(|_| "手动海拔区间格式应为 min-max，例如 11.6-22.8".to_string())?;
+        let min_m = left
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "手动海拔区间格式应为 min-max，例如 11.6-22.8".to_string())?;
+        let max_m = right
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "手动海拔区间格式应为 min-max，例如 11.6-22.8".to_string())?;
         return Ok(Some(AltitudeSpec::Range(validate_range(min_m, max_m)?)));
     }
-    let altitude_m = text.parse::<f64>().map_err(|_| "手动海拔应为数字或 min-max 区间，例如 17.2 或 11.6-22.8".to_string())?;
+    let altitude_m = text
+        .parse::<f64>()
+        .map_err(|_| "手动海拔应为数字或 min-max 区间，例如 17.2 或 11.6-22.8".to_string())?;
     validate_altitude(altitude_m)?;
     Ok(Some(AltitudeSpec::Single(altitude_m)))
 }
@@ -52,14 +60,16 @@ fn validate_range(min_m: f64, max_m: f64) -> Result<AltitudeRange, String> {
     Ok(AltitudeRange { min_m, max_m })
 }
 
-/// 将轨迹所有点的百度海拔覆盖为用户输入的绝对海拔（米）。
+/// 将轨迹海拔基准平移到用户输入的绝对海拔（米），保留生成器的 AR(1) 噪声形态。
 ///
-/// 返回 `Err` 而不是静默接受 NaN/无穷值，避免生成不可序列化或被服务端
-/// 拒绝的提交。海拔范围采用常见地表范围，既能覆盖地下场地也能覆盖高原。
+/// 真人设备的气压/GPS 海拔始终带噪声（NEUQ 实测 ε σ 0.9-3.5m），
+/// 全平海拔是合成指纹，因此这里只平移不抹平。
 pub fn override_bd_a(track: &mut Track, altitude_m: f64) -> Result<(), String> {
     validate_altitude(altitude_m)?;
+    let mean =
+        track.locations.iter().map(|p| p.bdA).sum::<f64>() / track.locations.len().max(1) as f64;
     for point in &mut track.locations {
-        point.bdA = round_to(altitude_m, 2);
+        point.bdA = round_to(altitude_m + (point.bdA - mean), 2);
         point.hasAltitude = true;
     }
     Ok(())
@@ -98,11 +108,14 @@ mod tests {
     }
 
     #[test]
-    fn override_replaces_every_bd_a_and_clears_ascent() {
+    fn override_shifts_mean_and_keeps_noise() {
         let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points());
         override_bd_a(&mut track, 36.75).unwrap();
-        assert!(track.locations.iter().all(|p| p.bdA == 36.75));
-        assert_eq!(total_ascent(&track.locations), 0.0);
+        let mean =
+            track.locations.iter().map(|p| p.bdA).sum::<f64>() / track.locations.len() as f64;
+        assert!((mean - 36.75).abs() < 0.5, "mean={mean}");
+        // 噪声保留：不退化为全平
+        assert!(track.locations.iter().any(|p| (p.bdA - 36.75).abs() > 0.05));
     }
 
     #[test]
@@ -114,15 +127,34 @@ mod tests {
 
     #[test]
     fn parses_single_value_and_range() {
-        assert_eq!(parse_spec("17.2").unwrap(), Some(AltitudeSpec::Single(17.2)));
-        assert_eq!(parse_spec("11.6-22.8").unwrap(), Some(AltitudeSpec::Range(AltitudeRange { min_m: 11.6, max_m: 22.8 })));
+        assert_eq!(
+            parse_spec("17.2").unwrap(),
+            Some(AltitudeSpec::Single(17.2))
+        );
+        assert_eq!(
+            parse_spec("11.6-22.8").unwrap(),
+            Some(AltitudeSpec::Range(AltitudeRange {
+                min_m: 11.6,
+                max_m: 22.8
+            }))
+        );
         assert!(parse_spec("22.8-11.6").is_err());
     }
 
     #[test]
     fn range_mapping_stays_inside_requested_bounds() {
         let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points());
-        override_bd_a_range(&mut track, AltitudeRange { min_m: 11.6, max_m: 22.8 }).unwrap();
-        assert!(track.locations.iter().all(|p| (11.6..=22.8).contains(&p.bdA)));
+        override_bd_a_range(
+            &mut track,
+            AltitudeRange {
+                min_m: 11.6,
+                max_m: 22.8,
+            },
+        )
+        .unwrap();
+        assert!(track
+            .locations
+            .iter()
+            .all(|p| (11.6..=22.8).contains(&p.bdA)));
     }
 }

@@ -20,6 +20,8 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         "record-info" => cmd_record_info(&rest),
         "obs-get" => cmd_obs_get(&rest),
         "obs-sample" => cmd_obs_sample(&rest),
+        "track-sample" => cmd_track_sample(&rest),
+        "track-splice" => super::splice::cmd_track_splice(&rest),
         "ai-records" => cmd_ai_records(&rest),
         "ai-info" => cmd_ai_info(&rest),
         "semester" => cmd_semester(),
@@ -48,7 +50,13 @@ fn cmd_login(rest: &[&str]) -> i32 {
         eprintln!("缺少 --user / --pass");
         return 1;
     };
-    let identity = model::load_identity();
+    let identity = match model::load_identity() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     let mut client = ApiClient::new(identity, None);
     let mut log = logger();
     match crate::api::login::login(&mut client, user, pw, &mut log) {
@@ -58,7 +66,10 @@ fn cmd_login(rest: &[&str]) -> i32 {
                 cfg.username = user.to_string();
                 cfg.password = pw.to_string();
                 cfg.remember = true;
-                let _ = model::save_config(&cfg);
+                if let Err(e) = model::save_config(&cfg) {
+                    eprintln!("登录成功，但凭据保存失败: {e}");
+                    return 1;
+                }
                 println!("凭据已保存（会话失效时自动重登）");
             }
             println!("登录成功 uid={} unid={} name={}", s.uid, s.unid, s.name);
@@ -72,7 +83,13 @@ fn cmd_login(rest: &[&str]) -> i32 {
 }
 
 fn cmd_logout() -> i32 {
-    let identity = model::load_identity();
+    let identity = match model::load_identity() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     let sess = model::load_session();
     let mut client = ApiClient::new(identity, sess.is_logged_in().then_some(sess));
     let mut log = logger();
@@ -405,7 +422,7 @@ fn cmd_obs_get(rest: &[&str]) -> i32 {
 }
 
 /// 解码 OBS 对象中 gzip+base64 的字段值（尽力而为）。
-fn decode_gz_fields(v: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn decode_gz_fields(v: &serde_json::Value) -> serde_json::Value {
     use base64::Engine;
     let mut out = v.clone();
     if let Some(obj) = out.as_object_mut() {
@@ -482,12 +499,14 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
     );
     let sess = client.login.clone().unwrap_or_default();
     let uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
-    let obj = crate::track::wire::build_obs_object(
+    let laps_bias = ((uuid.bytes().map(|b| b as u64).sum::<u64>() % 220) as f64) / 10.0 - 11.0;
+    let obj = crate::track::wire::build_obs_object_with_laps_bias(
         &track,
         rrid,
         &uuid,
         sess.uid,
         &crate::track::wire::five_point_wrapper(&pts, &track, &Default::default()),
+        laps_bias,
     );
     let out = get(&flags, "out").unwrap_or("obs_ours.json");
     let decoded = decode_gz_fields(&obj);
@@ -497,6 +516,134 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
     )
     .map_err(|e| eprintln!("写入失败: {e}"))
     .ok();
+    println!("已保存 {out}");
+    0
+}
+
+/// 离线生成一份 OBS 轨迹样本（不联网、不提交；判别器训练/评估用）。
+/// 点位取本地缓存文件（如 points_cache.json）的 points[].lat/lon（BD-09）；
+/// 提供 --osm 时走道路路由模式，否则经典拟合环模式。
+fn cmd_track_sample(rest: &[&str]) -> i32 {
+    let flags = parse_flags(rest);
+    let dist = get(&flags, "dist")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2100.0);
+    let dur = get(&flags, "dur")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(780);
+    let seed = get(&flags, "seed")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1);
+    let rrid = get(&flags, "rrid")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1320000000);
+    let start_ms = get(&flags, "start-ms")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1793000000000);
+    let uid = get(&flags, "uid")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(15264041);
+    let out = get(&flags, "out").unwrap_or("track_sample.json");
+    let points_file = get(&flags, "points").unwrap_or("points_cache.json");
+
+    let text = match std::fs::read_to_string(points_file) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("读取 {points_file} 失败: {e}");
+            return 1;
+        }
+    };
+    let cache: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("解析 {points_file} 失败: {e}");
+            return 1;
+        }
+    };
+    let pts: Vec<serde_json::Value> = cache
+        .get("points")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if pts.is_empty() {
+        eprintln!("点位缓存为空");
+        return 1;
+    }
+    let pts_bd: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|p| {
+            (
+                p.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                p.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            )
+        })
+        .collect();
+
+    let built = if let Some(osm) = get(&flags, "osm") {
+        let run = || -> Result<crate::track::model::Track, String> {
+            let mut net = crate::track::generate_road::load_network_path(osm)?;
+            crate::track::generate_road::align_network(&mut net);
+            crate::track::generate_road::build_road(
+                dist, dur, seed, start_ms, &pts_bd, &pts_bd, &net,
+            )
+        };
+        match run() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("道路模式生成失败: {e}");
+                return 1;
+            }
+        }
+    } else {
+        let n = pts_bd.len().max(1) as f64;
+        let c_lat = pts_bd.iter().map(|q| q.0).sum::<f64>() / n;
+        let c_lng = pts_bd.iter().map(|q| q.1).sum::<f64>() / n;
+        crate::track::generator::build(dist, dur, seed, (c_lat, c_lng), start_ms, &pts_bd)
+    };
+
+    // 离线样本：id 基准从 seed 派生（不占用真实设备计数器）
+    let mut built = built;
+    // 跨样本 id 链接（模拟线上设备计数器: 随运行次数递增）
+    let profile = crate::api::model::device_profile();
+    built.id_base = profile.point_id;
+    built.window_id_base = profile.window_id;
+    built.five_point_id_base = profile.five_point_id;
+    crate::api::model::bump_device_counters(
+        built.locations.len() as i64,
+        (built.locations.len() / 19).max(1) as i64,
+    );
+    for (i, p) in built.locations.iter_mut().enumerate() {
+        p.id = built.id_base + i as i64;
+    }
+
+    let uuid = uuid::Uuid::new_v4().to_string(); // 真机小写
+                                                 // 15% 记录整个缺失 laps_json 键
+    let laps_bias = if seed % 33 == 3 {
+        f64::NAN
+    } else {
+        ((uuid.bytes().map(|b| b as u64).sum::<u64>() % 220) as f64) / 10.0 - 11.0
+    };
+    let obj = crate::track::wire::build_obs_object_with_laps_bias(
+        &built,
+        rrid,
+        &uuid,
+        uid,
+        &crate::track::wire::five_point_wrapper(&pts, &built, &Default::default()),
+        laps_bias,
+    );
+    let decoded = decode_gz_fields(&obj);
+    match serde_json::to_string_pretty(&decoded) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(out, s) {
+                eprintln!("写入 {out} 失败: {e}");
+                return 1;
+            }
+        }
+        Err(e) => {
+            eprintln!("序列化失败: {e}");
+            return 1;
+        }
+    }
     println!("已保存 {out}");
     0
 }
@@ -645,10 +792,15 @@ fn cmd_cheat(rest: &[&str]) -> i32 {
     match crate::api::cheat::query(&mut client, page, &mut log) {
         Ok(r) => {
             println!("自查：{}", r.label());
-            println!("检查时间：{}", crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间"));
+            println!(
+                "检查时间：{}",
+                crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间")
+            );
             if r.status() == crate::api::cheat::Status::Flagged {
                 println!("服务端原因：{}；发生时间：{}", r.reason(), r.occurred_at());
-                if let Some(id) = r.record_id() { println!("关联跑步记录：{id}"); }
+                if let Some(id) = r.record_id() {
+                    println!("关联跑步记录：{id}");
+                }
             }
             println!("本页通报 {} 条（非全校总数）", r.list.len());
             for item in r.list.iter().take(20) {

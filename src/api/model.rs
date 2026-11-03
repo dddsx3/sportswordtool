@@ -136,42 +136,157 @@ fn exe_dir() -> std::path::PathBuf {
     crate::platform::data_dir()
 }
 
+/// 跨进程数据锁。`File::try_lock` 与 submission_guard 使用同一套 OS 文件锁语义。
+struct DataLock {
+    _file: std::fs::File,
+}
+
+impl DataLock {
+    /// 返回 None 表示数据目录不可写（例如只读安装目录）。此时仍允许读取有效数据，
+    /// 但任何写入都会由实际文件操作明确失败，不会静默覆盖。
+    fn acquire(name: &str) -> Result<Option<Self>, String> {
+        let path = exe_dir().join(format!("{name}.lock"));
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
+            Err(e) => return Err(format!("打开数据锁 {} 失败: {e}", path.display())),
+        };
+        file.try_lock()
+            .map_err(|_| format!("{name} 正在被另一个进程写入，请稍后重试"))?;
+        Ok(Some(Self { _file: file }))
+    }
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<Option<T>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            // Windows 编辑器可能写入 UTF-8 BOM；持久化文件应容忍它。
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            serde_json::from_str(text)
+                .map(Some)
+                .map_err(|e| format!("解析 {} 失败: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读取 {} 失败: {e}", path.display())),
+    }
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
-    let path = exe_dir().join(name);
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let dir = exe_dir();
+    if let Ok(Some(value)) = read_json_file(&dir.join(name)) {
+        return Some(value);
+    }
+    read_json_file(&dir.join(format!("{name}.bak")))
+        .ok()
+        .flatten()
+}
+
+fn quarantine_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let stamp = chrono::Utc::now().timestamp_millis();
+    let mut candidate = dir.join(format!("{name}.corrupt-{stamp}"));
+    let mut suffix = 1;
+    while candidate.exists() {
+        candidate = dir.join(format!("{name}.corrupt-{stamp}-{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+fn quarantine(
+    dir: &std::path::Path,
+    name: &str,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let target = quarantine_path(dir, name);
+    std::fs::rename(path, &target)
+        .map_err(|e| format!("保留损坏文件 {} 失败: {e}", path.display()))?;
+    Ok(target)
+}
+
+/// 原子替换：临时文件 + fsync，旧文件先改名为 .bak。
+/// 若旧文件不是合法 JSON，则移到 .corrupt-<时间戳>，避免覆盖仍可用的 .bak。
+fn write_json_unlocked<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
+    let dir = exe_dir();
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    let json = serde_json::to_vec_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
+    {
+        let mut file =
+            std::fs::File::create(&tmp).map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
+        use std::io::Write as _;
+        file.write_all(&json)
+            .map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("同步 {} 失败: {e}", tmp.display()))?;
+    }
+
+    let mut old_path = None;
+    if path.exists() {
+        let backup = dir.join(format!("{name}.bak"));
+        let valid_existing = std::fs::read_to_string(&path)
+            .ok()
+            .map(|text| {
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                serde_json::from_str::<serde_json::Value>(text).is_ok()
+            })
+            .unwrap_or(false);
+        let target = if valid_existing {
+            if backup.exists() {
+                std::fs::remove_file(&backup).map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    format!("清理旧备份 {} 失败: {e}", backup.display())
+                })?;
+            }
+            backup
+        } else {
+            quarantine_path(&dir, name)
+        };
+        std::fs::rename(&path, &target).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("备份 {} 失败: {e}", path.display())
+        })?;
+        old_path = Some(target);
+    }
+
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(old) = old_path {
+                let _ = std::fs::rename(&old, &path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("替换 {} 失败: {e}", path.display()))
+        }
+    }
 }
 
 fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
-    let path = exe_dir().join(name);
-    let json =
-        serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    let _lock = DataLock::acquire(name)?;
+    write_json_unlocked(name, value)
 }
 
-/// 加载设备身份；device_id / app_install_time 缺失时生成一次并立即落盘，
-/// 此后同一设备全生命周期复用（逐请求漂移会影响设备一致性）。
-pub fn load_identity() -> HeaderIdentity {
-    load_identity_for_platform(if cfg!(target_os = "android") {
-        "android"
-    } else {
-        "ios"
-    })
+fn default_identity(platform: &str) -> HeaderIdentity {
+    let mut identity = HeaderIdentity::default();
+    if platform == "android" {
+        identity.platform = "android".into();
+        // Generic fallback until the user opts in or fills the fields manually.
+        identity.device_name = "Android".into();
+        identity.os_version = "16".into();
+    }
+    identity
 }
 
-fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
-    let mut id: HeaderIdentity = read_json("identity.json").unwrap_or_else(|| {
-        let mut identity = HeaderIdentity::default();
-        if platform == "android" {
-            identity.platform = "android".into();
-            // Generic fallback until the user opts in or fills the fields manually.
-            identity.device_name = "Android".into();
-            identity.os_version = "16".into();
-        }
-        identity
-    });
+/// 补齐可变字段；device_id 不在这里生成，避免把损坏文件“修复”成新设备。
+fn fill_identity(id: &mut HeaderIdentity) -> bool {
     let mut dirty = false;
-    if id.device_id.is_empty() {
+    if id.device_id.trim().is_empty() {
         id.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
         dirty = true;
     }
@@ -184,10 +299,84 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
         id.mac_address = crate::crypto::header::random_mac();
         dirty = true;
     }
-    if dirty {
-        let _ = save_identity(&id);
+    dirty
+}
+
+/// 加载设备身份。文件损坏/缺少 device_id 时先尝试 `.bak`；两者都不可用则返回错误，
+/// 不再静默生成新设备（逐请求漂移会触发 10121 风控）。
+pub fn load_identity() -> Result<HeaderIdentity, String> {
+    load_identity_for_platform(if cfg!(target_os = "android") {
+        "android"
+    } else {
+        "ios"
+    })
+}
+
+fn load_identity_for_platform(platform: &str) -> Result<HeaderIdentity, String> {
+    let _lock = DataLock::acquire("identity.json")?;
+    let dir = exe_dir();
+    let path = dir.join("identity.json");
+    let backup = dir.join("identity.json.bak");
+    let primary_exists = path.exists();
+    let mut restored = false;
+
+    let mut primary = match read_json_file::<HeaderIdentity>(&path) {
+        Ok(value) => value,
+        Err(parse_error) => {
+            let saved = if path.exists() {
+                Some(quarantine(&dir, "identity.json", &path)?)
+            } else {
+                None
+            };
+            match read_json_file::<HeaderIdentity>(&backup)? {
+                Some(id) if !id.device_id.trim().is_empty() => {
+                    restored = true;
+                    Some(id)
+                }
+                _ => {
+                    return Err(format!(
+                        "{parse_error}{}；请恢复 identity.json.bak 或删除损坏文件后重新生成",
+                        saved
+                            .map(|p| format!("，原文件已保存为 {}", p.display()))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    };
+
+    let mut id = match primary.take() {
+        Some(id) if !id.device_id.trim().is_empty() => id,
+        Some(_) | None => {
+            if primary_exists {
+                let _ = quarantine(&dir, "identity.json", &path)?;
+            }
+            match read_json_file::<HeaderIdentity>(&backup)? {
+                Some(id) if !id.device_id.trim().is_empty() => {
+                    restored = true;
+                    id
+                }
+                _ => {
+                    if !primary_exists && !backup.exists() {
+                        let mut fresh = default_identity(platform);
+                        fill_identity(&mut fresh);
+                        write_json_unlocked("identity.json", &fresh)?;
+                        return Ok(fresh);
+                    }
+                    return Err(format!(
+                        "identity.json 损坏或缺少 device_id，已保留原文件；请恢复 {} 或删除损坏文件后重新生成",
+                        backup.display()
+                    ));
+                }
+            }
+        }
+    };
+
+    let filled = fill_identity(&mut id);
+    if restored || filled {
+        write_json_unlocked("identity.json", &id)?;
     }
-    id
+    Ok(id)
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -215,7 +404,23 @@ pub fn identity_with_device_info(
 }
 
 pub fn save_identity(id: &HeaderIdentity) -> Result<(), String> {
-    write_json("identity.json", id)
+    if id.device_id.trim().is_empty() {
+        return Err("设备 ID 不能为空；请先在设备信息页生成或填写".into());
+    }
+    let _lock = DataLock::acquire("identity.json")?;
+    let dir = exe_dir();
+    let path = dir.join("identity.json");
+    // 已存在但 device_id 为空/结构不合法的文件不能覆盖仍可用的 .bak。
+    match read_json_file::<HeaderIdentity>(&path) {
+        Ok(Some(existing)) if existing.device_id.trim().is_empty() => {
+            quarantine(&dir, "identity.json", &path)?;
+        }
+        Err(_) if path.exists() => {
+            quarantine(&dir, "identity.json", &path)?;
+        }
+        _ => {}
+    }
+    write_json_unlocked("identity.json", id)
 }
 
 /// AI 项目列表永久缓存：拉取成功即落盘，网络异常时兜底展示。
@@ -236,7 +441,9 @@ pub fn save_session(s: &Session) -> Result<(), String> {
 }
 
 pub fn clear_session() {
-    let _ = std::fs::remove_file(exe_dir().join("session.json"));
+    if let Ok(_lock) = DataLock::acquire("session.json") {
+        let _ = std::fs::remove_file(exe_dir().join("session.json"));
+    }
 }
 
 pub fn load_config() -> Config {
@@ -245,6 +452,47 @@ pub fn load_config() -> Config {
 
 pub fn save_config(c: &Config) -> Result<(), String> {
     write_json("config.json", c)
+}
+
+/// 设备级恒定参数与计数器。
+///
+/// NEUQ 真机指纹（33 条实测）：GPS accuracy 字段 98% 恒定（该机为 3.79），
+/// 点 id 与 10s 窗 id 为同一设备上跨次运行递增的计数器（点 id 中位 12031、
+/// 窗 id 中位 ~5000）。首次生成时抽取一次基准并落盘，此后跨次递增。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DeviceProfile {
+    pub radius_base: f64,
+    pub point_id: i64,
+    pub window_id: i64,
+    /// 五点载荷的点位 id（真机为 App 内部点表计数器，NEUQ 6 月实测 346..350）。
+    pub five_point_id: i64,
+}
+
+const DEVICE_PROFILE_FILE: &str = "device_profile.json";
+
+pub fn device_profile() -> DeviceProfile {
+    if let Some(p) = read_json::<DeviceProfile>(DEVICE_PROFILE_FILE) {
+        return p;
+    }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let profile = DeviceProfile {
+        // 7 位小数基准：f32 最短表示与真人 3.7900925 形态一致
+        radius_base: ((3.5 + rng.gen::<f64>() * 4.5) * 1e7).round() / 1e7,
+        point_id: 11_000 + (rng.gen::<f64>() * 4_000.0) as i64,
+        window_id: 4_000 + (rng.gen::<f64>() * 3_000.0) as i64,
+        five_point_id: 340 + (rng.gen::<f64>() * 160.0) as i64,
+    };
+    let _ = write_json(DEVICE_PROFILE_FILE, &profile);
+    profile
+}
+
+/// 一次完整轨迹生成后递增设备计数器（点数 + 窗口数）。
+pub fn bump_device_counters(points: i64, windows: i64) {
+    let mut p = device_profile();
+    p.point_id += points;
+    p.window_id += windows;
+    let _ = write_json(DEVICE_PROFILE_FILE, &p);
 }
 
 #[cfg(test)]
@@ -265,11 +513,11 @@ mod storage_tests {
             }
         }
         let _cleanup = Cleanup(directory);
-        let first = load_identity_for_platform("android");
+        let first = load_identity_for_platform("android").unwrap();
         assert_eq!(first.platform, "android");
         assert_ne!(first.device_name, "iPhone");
         assert!(uuid::Uuid::parse_str(&first.device_id).is_ok());
-        let again = load_identity_for_platform("android");
+        let again = load_identity_for_platform("android").unwrap();
         assert_eq!(
             serde_json::to_value(&first).unwrap(),
             serde_json::to_value(&again).unwrap()
@@ -282,7 +530,7 @@ mod storage_tests {
         let mut legacy = serde_json::to_value(&existing).unwrap();
         legacy.as_object_mut().unwrap().remove("manufacturer");
         write_json("identity.json", &legacy).unwrap();
-        let loaded = load_identity_for_platform("android");
+        let loaded = load_identity_for_platform("android").unwrap();
         assert_eq!(
             serde_json::to_value(&loaded).unwrap(),
             serde_json::to_value(&existing).unwrap(),
@@ -309,7 +557,7 @@ mod storage_tests {
             "import must preserve UUID, MAC, manual IMEI/IDFA, install time and location"
         );
         assert_eq!(
-            load_identity().device_name,
+            load_identity().unwrap().device_name,
             existing.device_name,
             "preview must not save implicitly"
         );
@@ -320,7 +568,7 @@ mod storage_tests {
             Some("Example"),
             "the consented brand must be written to identity.json"
         );
-        let reloaded = load_identity();
+        let reloaded = load_identity().unwrap();
         assert_eq!(
             serde_json::to_value(&reloaded).unwrap(),
             serde_json::to_value(&imported).unwrap(),
@@ -385,6 +633,93 @@ mod storage_tests {
         clear_session();
         assert!(!directory.join("session.json").exists());
         assert_eq!(load_session().uid, 0);
+    }
+
+    fn temp_root(tag: &str) -> (std::path::PathBuf, impl Drop) {
+        let directory = std::env::temp_dir().join(format!("neko-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        (directory.clone(), Cleanup(directory))
+    }
+
+    #[test]
+    fn atomic_write_keeps_previous_backup_and_recovers_corrupt_primary() {
+        let (directory, _cleanup) = temp_root("atomic");
+        let mut first = Config::default();
+        first.username = "one".into();
+        save_config(&first).unwrap();
+        let mut second = first.clone();
+        second.username = "two".into();
+        save_config(&second).unwrap();
+
+        let primary: Config =
+            serde_json::from_str(&std::fs::read_to_string(directory.join("config.json")).unwrap())
+                .unwrap();
+        let backup: Config = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("config.json.bak")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(primary.username, "two");
+        assert_eq!(backup.username, "one");
+
+        std::fs::write(directory.join("config.json"), b"{bad").unwrap();
+        assert_eq!(load_config().username, "one");
+    }
+
+    #[test]
+    fn corrupt_identity_recovers_from_backup_without_rotating() {
+        let (directory, _cleanup) = temp_root("identity-recover");
+        let first = load_identity_for_platform("ios").unwrap();
+        save_identity(&first).unwrap();
+        std::fs::write(directory.join("identity.json"), b"{bad").unwrap();
+
+        let recovered = load_identity_for_platform("ios").unwrap();
+        assert_eq!(recovered.device_id, first.device_id);
+        assert!(directory.join("identity.json").is_file());
+        assert!(directory.join("identity.json.bak").is_file());
+    }
+
+    #[test]
+    fn corrupt_identity_without_backup_is_rejected_not_regenerated() {
+        let (directory, _cleanup) = temp_root("identity-reject");
+        std::fs::write(directory.join("identity.json"), b"{bad").unwrap();
+
+        assert!(load_identity_for_platform("ios").is_err());
+        assert!(!directory.join("identity.json").exists());
+        let quarantined = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("identity.json.corrupt-")
+            })
+            .count();
+        assert_eq!(quarantined, 1);
+    }
+
+    #[test]
+    fn empty_identity_file_is_rejected_not_regenerated() {
+        let (directory, _cleanup) = temp_root("identity-empty");
+        std::fs::write(directory.join("identity.json"), b"{}").unwrap();
+
+        assert!(load_identity_for_platform("ios").is_err());
+        assert!(!directory.join("identity.json").exists());
+    }
+
+    #[test]
+    fn save_identity_rejects_empty_device_id() {
+        let (directory, _cleanup) = temp_root("identity-save-empty");
+        assert!(save_identity(&HeaderIdentity::default()).is_err());
+        assert!(!directory.join("identity.json").exists());
     }
 }
 

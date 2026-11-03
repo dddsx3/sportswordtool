@@ -5,6 +5,7 @@
 //! 即可（会话失效且已记住凭据时自动重登）。
 
 mod cmds;
+pub mod splice;
 
 use crate::api::client::ApiClient;
 use crate::api::model::{self, Session};
@@ -15,8 +16,13 @@ pub fn main(args: Vec<String>) -> i32 {
 }
 
 fn usage() {
+    let build = if cfg!(feature = "gui") {
+        "full 构建无参数启动 GUI"
+    } else {
+        "仅 CLI 构建，无 GUI"
+    };
     println!(
-        r#"NekoSportsWorldTool CLI（full 构建无参数启动 GUI）
+        r#"NekoSportsWorldTool CLI（{build}）
 
   login   --user <手机号> --pass <密码> [--remember]
                                            登录并保存会话；--remember 同时保存凭据供自动重登
@@ -24,6 +30,8 @@ fn usage() {
   run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
+  track-sample [--dist m] [--dur s] [--seed n] [--osm <路径>] [--points <缓存>]
+                                           离线生成 OBS 轨迹样本（不联网不提交；判别器评估用）
   ai-list                                  AI 运动项目列表
   ai     --sport <id> [--mode min|count] [--score n]
                                            AI 运动：min 按分钟 1-30；count 按次 5-1000 步长 5
@@ -93,7 +101,7 @@ pub(crate) fn auto_login(identity: &model::HeaderIdentity) -> Result<Session, St
 
 /// 构造已登录客户端；本地会话失效时自动重登一次。
 pub(crate) fn make_client() -> Result<ApiClient, String> {
-    let identity = model::load_identity();
+    let identity = model::load_identity()?;
     let client = {
         let sess = model::load_session();
         if sess.is_logged_in() {
@@ -122,13 +130,17 @@ pub(crate) fn fmt_hms(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+fn row_time(ms: i64) -> String {
+    fmt_hms(ms).get(5..).unwrap_or("-").to_string()
+}
+
 pub(crate) fn print_rows(rows: &[RecordRow]) {
     println!(
         "{:<16} {:>8} {:>8} {:>6} {:>6} {:>4} rrid",
         "时间", "距离m", "时长", "配速", "步频", "达标"
     );
     for r in rows {
-        let t = fmt_hms(r.start_time)[5..].to_string();
+        let t = row_time(r.start_time);
         let pace = if r.total_dis > 0.0 && r.total_time > 0 {
             let p = r.total_time as f64 / (r.total_dis / 1000.0);
             format!("{}:{:02}", (p / 60.0) as i64, (p as i64) % 60)
@@ -169,5 +181,16 @@ pub(crate) fn parse_pace(v: &str) -> f32 {
         m.parse::<f32>().unwrap_or(0.0) * 60.0 + s.parse::<f32>().unwrap_or(0.0)
     } else {
         v.parse().unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn row_time_handles_out_of_range_timestamp() {
+        assert_eq!(row_time(i64::MAX), "-");
+        assert!(row_time(0).contains(':'));
     }
 }

@@ -85,13 +85,19 @@ pub fn submit_record(
     }
     p.track.validate_consistency()?;
     validate_five_point_wrapper(&p.five_point_json)?;
-    let stop_ms = p.track.totalTime.checked_mul(1000)
-        .and_then(|n| p.track.startTime.checked_add(n)).ok_or("时间范围溢出")?;
+    let stop_ms = p
+        .track
+        .totalTime
+        .checked_mul(1000)
+        .and_then(|n| p.track.startTime.checked_add(n))
+        .ok_or("时间范围溢出")?;
     let mut guard = super::submission_guard::Guard::open(p.uid, p.selected_unid)?;
     if guard.has_pending() {
         match super::records::fetch_records(client) {
             Ok(rows) => {
-                for id in guard.reconcile(&rows)? { log(&format!("[record] 已核对先前记录 #{id}")); }
+                for id in guard.reconcile(&rows)? {
+                    log(&format!("[record] 已核对先前记录 #{id}"));
+                }
             }
             Err(e) => log(&format!("[record] 只读核对失败：{e}")),
         }
@@ -101,7 +107,10 @@ pub fn submit_record(
     match send_record(client, p, run_uuid.clone(), log) {
         Ok(result) => {
             if let Err(e) = guard.accepted(&run_uuid, result.rrid) {
-                log(&format!("[record] 服务端已接收记录 #{}，但本地回执保存失败：{e}。请勿重复提交", result.rrid));
+                log(&format!(
+                    "[record] 服务端已接收记录 #{}，但本地回执保存失败：{e}。请勿重复提交",
+                    result.rrid
+                ));
             }
             Ok(result)
         }
@@ -125,12 +134,19 @@ pub fn submit_record(
     }
 }
 
-enum SubmitFailure { Rejected(String), Unknown(String) }
+enum SubmitFailure {
+    Rejected(String),
+    Unknown(String),
+}
 impl From<String> for SubmitFailure {
-    fn from(error: String) -> Self { Self::Unknown(error) }
+    fn from(error: String) -> Self {
+        Self::Unknown(error)
+    }
 }
 impl From<&str> for SubmitFailure {
-    fn from(error: &str) -> Self { Self::Unknown(error.into()) }
+    fn from(error: &str) -> Self {
+        Self::Unknown(error.into())
+    }
 }
 
 fn send_record(
@@ -268,7 +284,11 @@ fn send_record(
     let resp = req.send_string(&body_env.json).map_err(|error| {
         let rejected = matches!(&error, ureq::Error::Status(401, _));
         let message = client.handle_request_error(error);
-        if rejected { SubmitFailure::Rejected(message) } else { SubmitFailure::Unknown(message) }
+        if rejected {
+            SubmitFailure::Rejected(message)
+        } else {
+            SubmitFailure::Unknown(message)
+        }
     })?;
     let status = resp.status();
     let raw = resp.into_string().unwrap_or_default();
@@ -286,9 +306,16 @@ fn send_record(
     let dec = decrypt_response(raw.as_bytes(), &key, &rsa_public_key())
         .map_err(|e| format!("提交响应解密失败: {e}"))?;
     let biz = check_business(&dec.business).map_err(|error| {
-        if dec.business.get("error").and_then(Value::as_i64).is_some_and(|code| code != 10000) {
+        if dec
+            .business
+            .get("error")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 10000)
+        {
             SubmitFailure::Rejected(error)
-        } else { SubmitFailure::Unknown(error) }
+        } else {
+            SubmitFailure::Unknown(error)
+        }
     })?;
     let rrid = super::client::get_field(&biz, "rrid")
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))

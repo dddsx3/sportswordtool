@@ -10,7 +10,7 @@ use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::location::Coordinate;
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
-use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
+use crate::track::wire::{build_obs_object_with_laps_bias, five_point_wrapper, obs_keys};
 use serde_json::Value;
 
 #[derive(Clone, Copy)]
@@ -249,6 +249,20 @@ pub fn run_full_flow_cancellable(
         crate::track::geom::fmt_cst(track.startTime, "%H:%M:%S"),
     ));
 
+    // 设备计数器：点 id 与窗 id 跨次运行递增（NEUQ 真机口径）
+    {
+        let prof = super::model::device_profile();
+        track.id_base = prof.point_id;
+        track.window_id_base = prof.window_id;
+        for (i, p) in track.locations.iter_mut().enumerate() {
+            p.id = track.id_base + i as i64;
+        }
+        super::model::bump_device_counters(
+            track.locations.len() as i64,
+            track.speedPerTenSec.len() as i64,
+        );
+    }
+
     // ④ 五点 wrapper（跑完态）
     track.validate_consistency()?;
     for point in &pol.must_points {
@@ -281,15 +295,25 @@ pub fn run_full_flow_cancellable(
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
     let mut track_for_obs = sp.track.clone();
     track_for_obs.startTime = result.start_ms;
-    let obj = build_obs_object(
+    // 圈爬升独立偏差：真机 laps 用独立气压计/滤波源（与 bdA 差 2-22m）；
+    // 15% 记录整个缺失 laps_json 键（App 版本行为）
+    let laps_bias = if result.uuid.bytes().sum::<u8>() % 33 == 3 {
+        f64::NAN
+    } else {
+        ((result.uuid.bytes().map(|b| b as u64).sum::<u64>() % 220) as f64) / 10.0 - 11.0
+    };
+    // 真机 uuid 全小写（含 OBS 键路径）
+    let uuid_lc = result.uuid.to_lowercase();
+    let obj = build_obs_object_with_laps_bias(
         &track_for_obs,
         result.rrid,
-        &result.uuid,
+        &uuid_lc,
         sess.uid,
         &sp.five_point_json,
+        laps_bias,
     );
     let payload = obj.to_string().into_bytes();
-    let keys = obs_keys(&track_for_obs, result.rrid, &result.uuid);
+    let keys = obs_keys(&track_for_obs, result.rrid, &uuid_lc);
     let obs_ok = super::obs::upload_both_keys(client, &keys, &payload, log);
     if obs_ok == 2 {
         log("√ [obs] 双 key 上传成功");
@@ -353,13 +377,22 @@ pub fn run_records(
     let rows = super::records::fetch_records(client)?;
     if let Some(session) = &client.login {
         let reconciliation = (|| {
-            let mut guard = super::submission_guard::Guard::open(session.uid, session.unid.parse().map_err(|_| "学校编号无效")?)?;
+            let mut guard = super::submission_guard::Guard::open(
+                session.uid,
+                session.unid.parse().map_err(|_| "学校编号无效")?,
+            )?;
             let found = guard.reconcile(&rows)?;
-            for id in found { log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交")); }
-            if guard.has_pending() { log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效"); }
+            for id in found {
+                log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交"));
+            }
+            if guard.has_pending() {
+                log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效");
+            }
             Ok::<_, String>(())
         })();
-        if let Err(error) = reconciliation { log(&format!("[record] 提交保护核对未完成：{error}")); }
+        if let Err(error) = reconciliation {
+            log(&format!("[record] 提交保护核对未完成：{error}"));
+        }
     }
     log(&format!("√ [records] {} 条记录", rows.len()));
     Ok(rows)

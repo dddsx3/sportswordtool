@@ -46,15 +46,22 @@ fn corner_fillet(
     let cross = dir_in[0] * dir_out[1] - dir_in[1] * dir_out[0];
     let dot = dir_in[0] * dir_out[0] + dir_in[1] * dir_out[1];
     let delta = cross.atan2(dot);
-    // A reversal has no finite tangent fillet: tan(pi/2) would cut halfway
-    // along the incoming edge and silently skip the turnaround checkpoint.
-    if delta.abs() < threshold_rad || std::f64::consts::PI - delta.abs() < 1e-6 {
+    // 转角过缓不切；接近掉头（>150°）也不切——此时圆弧半径必须极小，
+    // 强行打圆会自交成"钩子环"（真机 GPS 在掉头处就是尖锐折返）
+    const MAX_FILLET_TURN: f64 = 150.0 * std::f64::consts::PI / 180.0;
+    if delta.abs() < threshold_rad || delta.abs() > MAX_FILLET_TURN {
         return None;
     }
-    let d = (radius * (delta.abs() / 2.0).tan())
-        .min((len2(a, b).sqrt()) / 2.0)
-        .min((len2(b, c).sqrt()) / 2.0);
+    let half_tan = (delta.abs() / 2.0).tan();
+    // 切距受两侧边长限制；一旦被边长钳制，**必须**同步缩小半径，
+    // 否则圆弧与线段不再相切，几何上必然自交（之前的钩子环根因）。
+    let d_max = (len2(a, b).sqrt() / 2.0).min(len2(b, c).sqrt() / 2.0);
+    let d = (radius * half_tan).min(d_max);
     if d <= 0.0 {
+        return None;
+    }
+    let r_eff = d / half_tan;
+    if r_eff <= 1e-3 {
         return None;
     }
     let cut1 = [b[0] - dir_in[0] * d, b[1] - dir_in[1] * d];
@@ -62,7 +69,7 @@ fn corner_fillet(
     let sign = if delta >= 0.0 { 1.0 } else { -1.0 };
     // 内法线：dir_in 旋转 sign*90°
     let normal = [-dir_in[1] * sign, dir_in[0] * sign];
-    let center = [cut1[0] + normal[0] * radius, cut1[1] + normal[1] * radius];
+    let center = [cut1[0] + normal[0] * r_eff, cut1[1] + normal[1] * r_eff];
     Some((cut1, cut2, center, delta))
 }
 
@@ -80,6 +87,18 @@ mod regression_tests {
         let route = smooth_polyline(&pts, 6.0, 0.1);
         assert!(route.pts.contains(&pts[1]));
         assert_eq!(route.pts.last(), Some(&pts[2]));
+    }
+
+    #[test]
+    fn zero_step_returns_empty_without_hanging() {
+        use crate::graph::{Coord, RoadGraph};
+        let mut g = RoadGraph::new();
+        let a = Coord::new(0.0, 0.0);
+        let b = Coord::new(0.001, 0.001);
+        g.add_node(a);
+        g.add_node(b);
+        g.compute_anchor();
+        assert!(smooth_and_sample(&g, &[a, b], 6.0, 30.0, 0.0).is_empty());
     }
 }
 
@@ -112,16 +131,15 @@ fn smooth_polyline(pts: &[[f64; 2]], radius: f64, threshold_rad: f64) -> Smoothe
             Some((cut1, cut2, center, delta)) => {
                 push_line(&mut out, cursor, cut1);
                 // 采样圆弧
+                // 实际半径 = 圆心到切点距离（可能已被边长钳制缩小）
+                let r_eff = ((cut1[0] - center[0]).powi(2) + (cut1[1] - center[1]).powi(2)).sqrt();
                 let a1 = (cut1[1] - center[1]).atan2(cut1[0] - center[0]);
-                let steps = ((radius * delta.abs() / 0.5).ceil() as usize).max(2);
+                let steps = ((r_eff * delta.abs() / 0.5).ceil() as usize).max(2);
                 for j in 1..=steps {
                     let ang = a1 + delta * (j as f64 / steps as f64);
-                    let p = [
-                        center[0] + radius * ang.cos(),
-                        center[1] + radius * ang.sin(),
-                    ];
+                    let p = [center[0] + r_eff * ang.cos(), center[1] + r_eff * ang.sin()];
                     out.pts.push(p);
-                    out.k.push(1.0 / radius);
+                    out.k.push(1.0 / r_eff);
                 }
                 cursor = cut2;
             }
@@ -143,6 +161,9 @@ pub fn smooth_and_sample(
     threshold_deg: f64,
     step_m: f64,
 ) -> Vec<RoutePoint> {
+    if !step_m.is_finite() || step_m <= 0.0 {
+        return Vec::new();
+    }
     let pts_m: Vec<[f64; 2]> = coords.iter().map(|c| g.to_m(*c)).collect();
     let sm = smooth_polyline(&pts_m, radius, threshold_deg.to_radians());
 

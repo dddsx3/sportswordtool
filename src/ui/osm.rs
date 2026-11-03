@@ -354,6 +354,8 @@ impl App {
 
     /// 后台线程加载 OSM 路网，成功后经 `net_rx` 回传。
     pub fn load_osm_async(&mut self, path: String) {
+        // 资源管理器“复制为路径”会带双引号，先清理再读取/保存。
+        let path = crate::track::generate_road::normalize_local_path(&path);
         // Reading a local map must never depend on login, location or school APIs.
         let inputs = self.run_page.preview_inputs.clone();
         let campuses = self.osm_page.campuses.clone();

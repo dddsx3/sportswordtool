@@ -895,7 +895,13 @@ impl App {
     }
 
     fn start_run(&mut self) {
-        if self.run_busy { return; }
+        if self.run_busy {
+            return;
+        }
+        if self.identity.device_id.trim().is_empty() {
+            self.status = "× 设备身份无效，请到设备信息页生成或修复后重试".into();
+            return;
+        }
         if self.run_page.route_mode == RouteMode::Road && self.network.is_none() {
             self.status = "请先加载路网并刷新路线点位".into();
             return;

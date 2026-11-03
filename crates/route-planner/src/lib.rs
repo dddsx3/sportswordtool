@@ -51,6 +51,9 @@ pub fn plan_route(
     seed: u64,
     opts: &RouteOptions,
 ) -> Result<Route, String> {
+    if waypoints.is_empty() {
+        return Err("无起点".into());
+    }
     plan_route_split(net, waypoints, &waypoints[1..], target_len_m, seed, opts)
 }
 
@@ -84,7 +87,7 @@ pub fn plan_route_split(
     let anchor_nodes: Vec<NodeIndex> = vnodes[1 + must.len()..].to_vec();
 
     let path = route::plan_loop(
-        &g,
+        &mut g,
         start,
         &must_nodes,
         &anchor_nodes,
@@ -125,4 +128,16 @@ pub fn plan_route_split(
     }
     let length_m = points.last().map(|p| p.s).unwrap_or(0.0);
     Ok(Route { points, length_m })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_route_rejects_empty_waypoints_instead_of_panicking() {
+        let net = RoadGraph::new();
+        let error = plan_route(&net, &[], 1000.0, 0, &RouteOptions::default()).unwrap_err();
+        assert_eq!(error, "无起点");
+    }
 }

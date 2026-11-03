@@ -467,12 +467,20 @@ impl App {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let (identity, identity_error) = match model::load_identity() {
+            Ok(identity) => (identity, None),
+            Err(error) => (HeaderIdentity::default(), Some(error)),
+        };
         let mut app = Self::from_state(
             &cc.egui_ctx,
-            model::load_identity(),
+            identity,
             model::load_session(),
             model::load_config(),
         );
+        if let Some(error) = identity_error {
+            app.status = format!("× 设备身份读取失败：{error}");
+            app.tab = 5;
+        }
         if app.font_loaded.is_none() {
             app.log
                 .push("未找到中文字体（msyh/simhei/simsun），界面中文可能显示为方块");

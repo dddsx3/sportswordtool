@@ -563,7 +563,9 @@ fn school_401_clears_saved_session_but_preserves_manual_map_and_device_settings(
         ..Default::default()
     };
     model::save_session(&session).unwrap();
-    model::save_identity(&HeaderIdentity::default()).unwrap();
+    let mut saved_identity = HeaderIdentity::default();
+    saved_identity.device_id = "layout-test-device".into();
+    model::save_identity(&saved_identity).unwrap();
     model::save_config(&Config::default()).unwrap();
     let ctx = egui::Context::default();
     let mut app = App::from_state(
