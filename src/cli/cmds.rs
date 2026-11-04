@@ -545,6 +545,13 @@ fn cmd_track_sample(rest: &[&str]) -> i32 {
         .unwrap_or(15264041);
     let out = get(&flags, "out").unwrap_or("track_sample.json");
     let points_file = get(&flags, "points").unwrap_or("points_cache.json");
+    // 可选独立起点（真机用户从宿舍等固定位置起跑，不是打卡点本身）
+    let start_override: Option<(f64, f64)> = get(&flags, "start").and_then(|v| {
+        let mut it = v.split(',');
+        let lat = it.next()?.trim().parse::<f64>().ok()?;
+        let lon = it.next()?.trim().parse::<f64>().ok()?;
+        Some((lat, lon))
+    });
 
     let text = match std::fs::read_to_string(points_file) {
         Ok(t) => t,
@@ -580,11 +587,19 @@ fn cmd_track_sample(rest: &[&str]) -> i32 {
         .collect();
 
     let built = if let Some(osm) = get(&flags, "osm") {
+        // 独立起点（真机用户从宿舍等固定位置起跑，不是打卡点本身）：
+        // 起点 + 全部打卡点作为必经序列
+        let route_bd: Vec<(f64, f64)> = match start_override {
+            Some((s0, s1)) => std::iter::once((s0, s1))
+                .chain(pts_bd.iter().copied())
+                .collect(),
+            None => pts_bd.clone(),
+        };
         let run = || -> Result<crate::track::model::Track, String> {
             let mut net = crate::track::generate_road::load_network_path(osm)?;
             crate::track::generate_road::align_network(&mut net);
             crate::track::generate_road::build_road(
-                dist, dur, seed, start_ms, &pts_bd, &pts_bd, &net,
+                dist, dur, seed, start_ms, &route_bd, &pts_bd, &net,
             )
         };
         match run() {

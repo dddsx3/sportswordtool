@@ -40,7 +40,7 @@ impl Default for RouteOptions {
             min_radius_m: 6.0,
             repeat_penalty: 4.0,
             snap_m: 30.0,
-            turn_weight_m: 25.0,
+            turn_weight_m: 70.0,
         }
     }
 }
@@ -60,10 +60,21 @@ pub fn shortest_path(g: &RoadGraph, from: NodeIndex, to: NodeIndex) -> Option<Ve
         &g.graph,
         from,
         |n| n == to,
-        |e| e.weight().length_m,
+        |e| e.weight().length_m * road_class_factor(&e.weight().highway),
         |_| 0.0,
     );
     res.map(|(_cost, path)| path)
+}
+
+/// 主干道偏好因子：真人路线偏爱宽直主干道（turns_per_km 2.4 vs 巷道网格 8+），
+/// A* 与游走评分按道路等级加权（trunk/主次干道降权，footway/service 升权）。
+pub fn road_class_factor(highway: &str) -> f64 {
+    match highway {
+        "trunk" | "primary" | "secondary" | "tertiary" => 0.68,
+        "primary_link" | "secondary_link" | "tertiary_link" => 0.9,
+        "residential" | "unclassified" | "living_street" => 1.0,
+        _ => 1.75, // footway / path / service / steps / pedestrian…
+    }
 }
 
 fn dist_nodes(g: &RoadGraph, a: NodeIndex, b: NodeIndex) -> f64 {
@@ -203,7 +214,9 @@ fn wander_open(
                 Some(pd) => opts.turn_weight_m * angle_diff(pd, dir_e),
                 None => 0.0,
             };
-            let mut score = ed.length_m * (1.0 + opts.repeat_penalty * used_n) + turn;
+            let mut score =
+                ed.length_m * road_class_factor(&ed.highway) * (1.0 + opts.repeat_penalty * used_n)
+                    + turn;
             // 方向偏置：对齐 desired 减分（更优）
             score -= ed.length_m * 0.6 * (dir_e - desired).cos();
             // 节点重访惩罚：绕圈回同一路口是本项专门阻止的形态
@@ -490,7 +503,7 @@ pub fn plan_loop(
                     cur,
                     |n| n == t,
                     |e| {
-                        let base_w = e.weight().length_m;
+                        let base_w = e.weight().length_m * road_class_factor(&e.weight().highway);
                         let (a, b) = g.graph.edge_endpoints(e.id()).unwrap();
                         // 点到线段最近距离：端点贴圈的边同样算入（只查中点会漏掉
                         // 「端点在圈内、中点在圈外」的长边，路径可合法经过距

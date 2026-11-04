@@ -138,12 +138,14 @@ pub fn five_point_payload(points: &[Value], track: &Track) -> Vec<Value> {
 
 /// Construct once and reuse exactly for submit and OBS.
 pub fn five_point_wrapper(points: &[Value], track: &Track, area: &RunAreaMeta) -> String {
+    // 真机 fp 键为字母序（盲查：fivePointJson, freedomShowFence, geoFencesJson,
+    // runAreaId, useZip）——序列化顺序对齐 App 端
     json!({
-        "useZip": false,
         "fivePointJson": Value::Array(five_point_payload(points, track)).to_string(),
-        "runAreaId": area.run_area_id,
-        "geoFencesJson": Value::Array(area.geo_fences.clone()).to_string(),
         "freedomShowFence": area.freedom_show_fence,
+        "geoFencesJson": Value::Array(area.geo_fences.clone()).to_string(),
+        "runAreaId": area.run_area_id,
+        "useZip": false,
     })
     .to_string()
 }
@@ -231,14 +233,15 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
         cum_d += a.value;
         cum_s += b.value;
         let id = track.window_id_base + k as i64;
-        // 真机 speed/step 两数组共享一个递增 queueNum（严格唯一）
+        // 真机 speed/step 的 id 共享窗计数器；queueNum 各自独立 0..N-1
+        // （盲查实测：speed.qn 与 steps.qn 均为 0,1,2,... 步长 1）
         sp.push(json!({
             "beginTime": start_ms + lo_ms,
             "distance": a.value,
             "endTime": start_ms + hi_ms,
             "flag": start_ms,
             "id": id,
-            "queueNum": (2 * k) as i64,
+            "queueNum": k as i64,
             "state": 0,
         }));
         // 步数取累计差，保证窗口求和与总步数一致
@@ -251,7 +254,7 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
             "id": id,
             "maxDiff": 0.0,
             "minDiff": 1000.0,
-            "queueNum": (2 * k + 1) as i64,
+            "queueNum": k as i64,
             "state": 0,
             "stepsNum": steps_num as i64,
         }));
@@ -263,6 +266,11 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
 /// segment_json：真人与 10s 窗一一对应（边界取整秒），avgSpeed 单位 min/km
 /// 全精度，avgStep 为窗口步/分，id 沿用设备窗计数器，speedStandard=900。
 fn build_segments(track: &Track) -> Vec<Value> {
+    // 真人 segment id 与 speed id 是两条独立自增序列（盲查：偏移 -17~+7
+    // 随条变化）——用独立派生基准，避免同池重合
+    let seg_id_base = track.window_id_base.wrapping_add(
+        (super::geom::Rng::new(track.startTime as u64 ^ 0x5E_61_D7A).uniform(-40.0, 40.0)) as i64,
+    );
     // 段 state 131072 罕见变体（真机 2/33 文件）
     let seg_state = if super::geom::Rng::new(track.startTime as u64 ^ 0x5E6_57_1E).random() < 0.06 {
         131072
@@ -280,7 +288,7 @@ fn build_segments(track: &Track) -> Vec<Value> {
                 "distance": s.distance,
                 "endTime": s.endTime,
                 "flag": track.startTime,
-                "id": track.window_id_base + k as i64,
+                "id": seg_id_base + k as i64,
                 "intervalStepModel": 0,
                 "originAvgStep": s.avgStep,
                 "speedStandard": 900,
@@ -412,17 +420,19 @@ pub fn build_obs_object_with_laps_bias(
         }
     }
     let segments = build_segments(track);
+    // 真机顶层键序（盲查实测）：uid, run_data, step_freq_json, speed_json,
+    // runFaceCheck, laps_json, uuid, rrid, segment_json, fixed_point_json
     let mut obj = json!({
-        "rrid": gz_str(&rrid_obj.to_string()),
-        "uuid": gz_str(uuid),
         "uid": gz_str(&uid.to_string()),
         "run_data": gz_json(&run_wrap),
-        "fixed_point_json": gz_str(five_point_json),
-        "segment_json": gz_json(&Value::Array(segments)),
-        "speed_json": gz_json(&Value::Array(sp)),
         "step_freq_json": gz_json(&Value::Array(stf)),
-        "laps_json": gz_json(&Value::Array(laps)),
+        "speed_json": gz_json(&Value::Array(sp)),
         "runFaceCheck": gz_str(""),
+        "laps_json": gz_json(&Value::Array(laps)),
+        "uuid": gz_str(uuid),
+        "rrid": gz_str(&rrid_obj.to_string()),
+        "segment_json": gz_json(&Value::Array(segments)),
+        "fixed_point_json": gz_str(five_point_json),
     });
     // 真机 6/33 记录整个缺失 laps_json 键（App 版本行为）
     if laps_bias.is_nan() {
@@ -579,14 +589,17 @@ mod regression_tests {
             .read_to_string(&mut decoded)
             .unwrap();
         assert_eq!(decoded, wrapper);
-        let (speed, steps) = build_windows(&linear_track(1100.0, 603, 1201), 60);
-        assert_eq!(speed.last().unwrap()["endTime"], 603000);
-        assert!(speed.last().unwrap()["beginTime"].as_i64().unwrap() < 603000);
-        // 真机 speed/step 两数组共享递增 queueNum（交错）
+        let lt = linear_track(1100.0, 603, 1201);
+        // startTime 带真机毫秒偏移（flag=now_ms），窗口时刻相对 startTime
+        let st = lt.startTime;
+        let (speed, steps) = build_windows(&lt, 60);
+        assert_eq!(speed.last().unwrap()["endTime"], st + 603000);
+        assert!(speed.last().unwrap()["beginTime"].as_i64().unwrap() < st + 603000);
+        // 真机 speed/steps 的 queueNum 各自独立 0..N-1（盲查实测步长 1）
         assert_eq!(speed[0]["queueNum"], 0);
-        assert_eq!(speed[1]["queueNum"], 2);
-        assert_eq!(steps[0]["queueNum"], 1);
-        assert_eq!(steps[1]["queueNum"], 3);
+        assert_eq!(speed[1]["queueNum"], 1);
+        assert_eq!(steps[0]["queueNum"], 0);
+        assert_eq!(steps[1]["queueNum"], 1);
         assert_eq!(
             steps
                 .iter()

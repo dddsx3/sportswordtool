@@ -358,17 +358,18 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
+            // 真机顶层键序（盲查实测）
             vec![
-                "rrid",
-                "uuid",
                 "uid",
                 "run_data",
-                "fixed_point_json",
-                "segment_json",
-                "speed_json",
                 "step_freq_json",
+                "speed_json",
+                "runFaceCheck",
                 "laps_json",
-                "runFaceCheck"
+                "uuid",
+                "rrid",
+                "segment_json",
+                "fixed_point_json"
             ]
         );
         // rrid gzip 可解

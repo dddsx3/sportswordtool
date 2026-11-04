@@ -71,7 +71,8 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
     // 真机 gainTime 是打点时钟：漂移恒定，偶发 ±3-17s 校正
     // （ΔgainTime ≡ ΔtotalTime 占 82-99%）
     let n_pts = locs.len();
-    let mut drift_s = rng.uniform(0.5, 6.5);
+    // 真人首点 gainTime-flag = -0.68~+0.16s：打点时钟起始即对齐 flag
+    let mut drift_s = rng.uniform(-0.6, 0.3);
     for (idx, p) in locs.iter_mut().enumerate() {
         if idx > 0 && rng.random() < 0.03 {
             drift_s = (drift_s + rng.uniform(-17.0, 17.0)).clamp(0.0, 37.0);

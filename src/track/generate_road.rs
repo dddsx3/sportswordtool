@@ -245,7 +245,7 @@ fn required_route(
     // 从最后打卡点沿路网补距到目标（开放路径：不绕圈、不回家）。
     let opts = RouteOptions {
         a_c_max: 2.5,
-        min_radius_m: (avg * avg / 2.5).max(6.0),
+        min_radius_m: (avg * avg / 2.5).max(6.0) * 2.2,
         repeat_checkpoint_loop: true,
         // 末端补距游走的 way 重复惩罚（抑制沿同一条路来回蹭）
         repeat_penalty: 4.0,
@@ -295,6 +295,10 @@ fn required_route(
 
 /// 各打卡点首次进入 25m 判定圈的顺序必须是传入顺序（0→1→2→…）。
 /// `points` 与轨迹同为 BD-09（build_road 内部轨迹尚未做 conv_point 转换）。
+fn stop_idx_range_contains(walk_stops: &[(usize, usize, Vec<i64>)], k: usize) -> bool {
+    walk_stops.iter().any(|(a, b, _)| k >= *a && k <= *b)
+}
+
 fn seq_pass_ok(locs: &[GenPoint], points: &[(f64, f64)]) -> bool {
     let mut first: Vec<Option<usize>> = points.iter().map(|_| None).collect();
     for (i, p) in locs.iter().enumerate() {
@@ -347,6 +351,9 @@ fn build_road_inner(
         return Err("距离和时长必须为正数".into());
     }
     let mut rng = Rng::new(seed);
+    // 真机 flag=开跑时刻 now_ms：毫秒非零且每条恒定（33 条观测 13-726ms；
+    // 均匀 0-999 中 0 的概率仅 0.1%）。测试参数常传整秒 -> 内部统一加恒定偏移。
+    let start_ms = start_ms + 13 + (rng.uniform(0.0, 974.0)) as i64;
     let dur_f = dur as f64;
     let avg_v = dist / dur_f;
     let a_c_max = 2.5;
@@ -516,6 +523,176 @@ fn build_road_inner(
             kinds[i] = (0, 1);
         }
     }
+    // 真机停走微段（毛刺链）计划：真人 30/33 有 1-5 个 speed 爆炸点
+    // （speed=16.6667/avgSpeed，停走时 avgSpeed≈0.002-0.8 -> 21-8333）。
+    // 形态（12d342f6 idx58-63）：totalTime 堆叠同秒、totalDis 冻结、坐标
+    // 微动 0.1-5m/点、type 多为 3/2、count 乱跳后冻结、bdS 骤降。
+    // 计划在距离分派前掷定：毛刺点不消费弧长（totalDis 冻结），其余点
+    // 等比分摊 walk_dist -> 总里程语义不变。
+    // 打卡点邻域避让：毛刺段/漂移弧挪走打卡点 40m 捕获范围内的采样点
+    // 会让 passes_point 失败（重试也难以同时满足 passes+按序）。
+    let avg_step_m = walk_dist / n.max(1) as f64;
+    let cp_zones: Vec<(f64, f64)> = required
+        .iter()
+        .map(|(clat, clng)| {
+            let hits: Vec<f64> = route
+                .points
+                .iter()
+                .filter(|rp| {
+                    let dy = (rp.lat - clat) * MET_PER_DEG_LAT;
+                    let dx = (rp.lon - clng) * MET_PER_DEG_LNG;
+                    dx.hypot(dy) < 48.0
+                })
+                .map(|rp| rp.s)
+                .collect();
+            if hits.is_empty() {
+                (-1.0, -1.0)
+            } else {
+                (
+                    hits.first().unwrap() / avg_step_m - 4.0,
+                    hits.last().unwrap() / avg_step_m + 4.0,
+                )
+            }
+        })
+        .collect();
+    let mut walk_stops: Vec<(usize, usize, Vec<i64>)> = Vec::new(); // (first, last, types)
+    if n > 30 && rng.random() > 0.12 {
+        let n_stop = if rng.random() < 0.7 { 1 } else { 2 };
+        let lo = (n as f64 * 0.15) as usize;
+        let hi = (n as f64 * 0.88) as usize;
+        for _ in 0..n_stop {
+            let s0 = lo + (rng.uniform(0.0, (hi - lo).max(1) as f64)) as usize;
+            let seg_len = 1 + (rng.uniform(0.0, 5.0)) as usize; // 1-5 点
+            let e0 = (s0 + seg_len).min(n.saturating_sub(3));
+            if cp_zones
+                .iter()
+                .any(|(z0, z1)| *z0 >= 0.0 && (s0 as f64) <= *z1 && (e0 as f64) >= *z0)
+            {
+                continue;
+            }
+            // 段间互斥（含余量），避免双段叠加踩踏累计字段
+            if e0 <= s0
+                || e0 + 1 >= n
+                || walk_stops
+                    .iter()
+                    .any(|(a, b, _)| s0 <= b + 10 && *a <= e0 + 10)
+            {
+                continue;
+            }
+            let mut tw = Vec::with_capacity(e0 - s0);
+            for _ in 0..(e0 - s0) {
+                let u = rng.random();
+                tw.push(if u < 0.40 {
+                    3
+                } else if u < 0.50 {
+                    2
+                } else {
+                    0
+                });
+            }
+            walk_stops.push((s0, e0, tw));
+        }
+    }
+    // 毛刺点不可能是失定位点（真人毛刺链 type 0/2/3）
+    for (s0, e0, _) in &walk_stops {
+        for k in *s0..=*e0 {
+            if kinds[k].0 == -1 {
+                kinds[k] = (0, 1);
+            }
+        }
+    }
+    // 真机 GPS 位移尖峰：真人逐点速度分布与生成几乎一致（p50 6.1/6.2、
+    // p95 7.5/7.7 km/h），但每条轨迹含 1-2 个稀疏漂移弧（impl_max 中位
+    // 15km/h、上界 61）——AR(1) 高斯无此重尾。漂移弧 = 3-5 点正弦弧沿
+    // 路线法向渐进偏移（真机 GPS 漂移沿行进弧线拖尾，不产生 V 形大转角，
+    // 段间角 ≤ atan(Δoff/12.8) < 45°）。位移计入 totalDis（真机一致），
+    // 预算从正常点弧长中预留。
+    let mut drift_arcs: Vec<(usize, usize, f64, bool)> = Vec::new(); // (k0, pts, amp_m, left_side)
+    if n > 30 {
+        let n_arc = if rng.random() < 0.25 {
+            0
+        } else if rng.random() < 0.6 {
+            1
+        } else {
+            2
+        };
+        for _ in 0..n_arc {
+            let k0 = 6 + (rng.uniform(0.0, (n - 42) as f64)) as usize;
+            let m = 3; // 3 点弧：sin 对称性使 Δoff 最大 (sin(π/2)-sin(π/4))A，角 <45°
+            if k0 + m + 2 >= n
+                || (0..=m).any(|j| stop_idx_range_contains(&walk_stops, k0 + j))
+                || drift_arcs
+                    .iter()
+                    .any(|(a, b, _, _)| k0 < a + b + 6 && *a < k0 + m + 6)
+                || cp_zones
+                    .iter()
+                    .any(|(z0, z1)| *z0 >= 0.0 && ((k0 + m) as f64) >= *z0 && (k0 as f64) <= *z1)
+            {
+                continue;
+            }
+            let amp = rng.uniform(30.0, 40.0);
+            let left0 = rng.random() < 0.5;
+            // 计划期围栏预检：用 route 路线坐标 + 法向偏移模拟弧点，
+            // 双侧都出界的弧直接丢弃（arc_cost 不含它，位移预算闭合）
+            let mut ok_any = net.boundaries.is_empty();
+            if !ok_any {
+                for side in [left0, !left0] {
+                    let mut ok_side = true;
+                    for j in 1..=m {
+                        let arc = (k0 + j) as f64 * avg_step_m;
+                        let ri = route
+                            .points
+                            .partition_point(|p| p.s < arc)
+                            .min(route.points.len() - 1);
+                        let rp = route.points[ri];
+                        let tt = j as f64 / (m + 1) as f64;
+                        let off = amp * (std::f64::consts::PI * tt).sin();
+                        // 法向：路线方向旋转 ±90°
+                        let idx2 = ((k0 + j + 1) as f64 * avg_step_m) as usize;
+                        let rp2 = route.points.get(idx2.min(route.points.len() - 1)).unwrap();
+                        let (dx, dy) = (
+                            (rp2.lon - rp.lon) * MET_PER_DEG_LNG,
+                            (rp2.lat - rp.lat) * MET_PER_DEG_LAT,
+                        );
+                        let dl = (dx * dx + dy * dy).sqrt().max(1e-6);
+                        let (nx, ny) = if side { (-dy, dx) } else { (dy, -dx) };
+                        let cand = Coord::new(
+                            rp.lon + nx * off / dl / MET_PER_DEG_LNG,
+                            rp.lat + ny * off / dl / MET_PER_DEG_LAT,
+                        );
+                        if !route_planner::boundary::contains(&net.boundaries, cand) {
+                            ok_side = false;
+                            break;
+                        }
+                    }
+                    if ok_side {
+                        ok_any = true;
+                        break;
+                    }
+                }
+            }
+            if !ok_any {
+                continue;
+            }
+            drift_arcs.push((k0, m, amp, left0));
+        }
+    }
+    // 漂移弧位移预算（解析近似：段长 √(d²+Δoff²)，d 取中位段长 12.8m）
+    let arc_cost: f64 = drift_arcs
+        .iter()
+        .map(|(_, m, amp, _)| {
+            let mut cost = 0.0;
+            let mut prev_off = 0.0f64;
+            for j in 1..=*m {
+                let tt = j as f64 / (*m + 1) as f64;
+                let off = amp * (std::f64::consts::PI * tt).sin();
+                let dd = ((12.8f64).powi(2) + (off - prev_off).powi(2)).sqrt() - 12.8;
+                cost += dd.max(0.0);
+                prev_off = off;
+            }
+            cost
+        })
+        .sum();
     // 逐次运行 GPS 质量 + 设备精度指纹（与经典模式一致）
     let state2_rate = if rng.random() < 0.06 {
         rng.uniform(0.60, 0.95)
@@ -523,12 +700,53 @@ fn build_road_inner(
         0.0
     };
     let radius_base = crate::api::model::device_profile().radius_base;
-    let normal_idx: Vec<usize> = (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
+    let stop_idx: std::collections::HashSet<usize> =
+        walk_stops.iter().flat_map(|(a, b, _)| *a..=*b).collect();
+    let normal_idx: Vec<usize> = (0..n)
+        .filter(|&i| kinds[i].0 != -1 && i > 1 && !stop_idx.contains(&i))
+        .collect();
     let share: f64 = normal_idx.iter().map(|&i| seg_dist[i]).sum();
     let share = if share == 0.0 { 1.0 } else { share };
+    // 尖峰位移计入 totalDis（真机一致）-> 从正常点弧长预算中预留，
+    // 避免坐标累计超出 walk_dist 触发重定标破坏 0.9989 球面比指纹
+    // 真人 impl_max 中位 15km/h = 真实快跑段（4'00" 配速冲刺）；OU 速度
+    // 分布对称无右尾，稀疏快跑窗（1-2 个 2-3 点、倍率 2.0-2.6）沿路线
+    // 直线加速——无大转角、无横跨。总弧长闭合解精确保持 walk_dist。
+    let mut sprints: Vec<(usize, usize, f64)> = Vec::new(); // (first, last, mult)
+    {
+        let n_s = if rng.random() < 0.45 { 1 } else { 2 };
+        for _ in 0..n_s {
+            let s1 = 8 + (rng.uniform(0.0, (n - 20) as f64)) as usize;
+            let e1 = s1 + 2 + (rng.random() < 0.5) as usize;
+            if e1 >= n
+                || (s1..=e1).any(|j| stop_idx_range_contains(&walk_stops, j))
+                || sprints.iter().any(|(a, b, _)| s1 <= *b + 6 && *a <= e1 + 6)
+                || drift_arcs
+                    .iter()
+                    .any(|(a, b, _, _)| s1 <= a + b + 6 && *a <= e1 + 6)
+                || cp_zones
+                    .iter()
+                    .any(|(z0, z1)| *z0 >= 0.0 && (e1 as f64) >= *z0 && (s1 as f64) <= *z1)
+            {
+                continue;
+            }
+            sprints.push((s1, e1, rng.uniform(1.5, 1.7)));
+        }
+    }
+    let sprint_seg: f64 = sprints
+        .iter()
+        .map(|(a, b, mult)| ((*a)..=*b).map(|j| seg_dist[j]).sum::<f64>() * (*mult - 1.0))
+        .sum();
     let mut disp_of = vec![0.0f64; n];
+    let walk_eff = (walk_dist - arc_cost).max(walk_dist * 0.9);
+    let denom = (share + sprint_seg).max(1.0);
     for &i in &normal_idx {
-        disp_of[i] = seg_dist[i] * (walk_dist / share);
+        disp_of[i] = seg_dist[i] * (walk_eff / denom);
+    }
+    for (a, b, mult) in &sprints {
+        for j in *a..=*b {
+            disp_of[j] *= mult;
+        }
     }
 
     // 建筑 SDF（自适应放大漂移）
@@ -558,7 +776,8 @@ fn build_road_inner(
         })
         .collect();
     let cadence_seed = seed.wrapping_add(0xC6A4_A793_5BD1_E995);
-    let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.12, 0.4, 120.0, 236.0);
+    // 窗口步数 CV 校准：真人 0.070-0.166（中位 0.10）；sigma 决定窗间波动
+    let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.10, 2.5, 120.0, 236.0);
 
     // GPS 抖动：AR(1) 相关漂移为主，独立测量噪声极小。
     // 真机 App 存的轨迹是**滤波后**的：横向偏离是 50-200m 尺度的缓慢漂移，
@@ -572,10 +791,13 @@ fn build_road_inner(
     let mut dist_acc = 0.0f64;
     let mut steps_acc = 0.0f64;
     // 海拔：AR(1)（同经典模式，NEUQ 实测口径）
-    let mut alt = rng.uniform(-1.0, 25.0);
+    // 真人 bdA 中位 5.75-9.68（盲查）：初值收窄
+    let mut alt = rng.uniform(2.0, 12.0);
     let alt_base = alt;
-    let alt_phi = rng.uniform(0.85, 0.97);
-    let alt_sigma = rng.uniform(0.9, 2.6);
+    // 真人海拔形态：缓爬缓降趋势（gain/std=13），AR 趋势项 phi 主导，
+    // σ 决定窗口内抖动（真人 alt_std 1.8-9.2 中位 3.4、gain 44.7）
+    let alt_phi = rng.uniform(0.95, 0.99);
+    let alt_sigma = rng.uniform(0.5, 1.6) * 0.9;
     let alt_sink = rng.random() < 0.7;
     let alt_sink_m = rng.uniform(2.0, 15.0);
     // 卫星数：真机每跑 max 37-54（一个 80），劣 GPS episode 降到 0-8
@@ -784,6 +1006,274 @@ fn build_road_inner(
             &net.boundaries,
             start_ms,
         )?;
+    }
+
+    // ===== App GPS 滤波模拟 =====
+    // 真机存储的轨迹是定位引擎滤波后的（转角被均化，head_mean 6.1 vs
+    // 路网折线 9+）：3 点滑动平均 (0.25,0.5,0.25)，位移 ±0.6m 内不破坏
+    // 沿路网视觉；毛刺/尖峰在滤波后施加（不受均化影响）。
+    if locs.len() >= 5 {
+        let src: Vec<(f64, f64)> = locs.iter().map(|p| (p.gLat, p.gLng)).collect();
+        let mut sm = Vec::with_capacity(locs.len());
+        for i in 0..locs.len() {
+            if i == 0 || i + 1 == locs.len() {
+                sm.push(src[i]);
+            } else {
+                let (a, b, c) = (src[i - 1], src[i], src[i + 1]);
+                sm.push((
+                    0.35 * a.0 + 0.3 * b.0 + 0.35 * c.0,
+                    0.35 * a.1 + 0.3 * b.1 + 0.35 * c.1,
+                ));
+            }
+        }
+        // 保长重构：段长取原始、方向取滤波后（真机滤波压角不压位移，
+        // disp_p5 不受滤波影响）
+        let mut chain = vec![sm[0]];
+        for i in 1..locs.len() {
+            let (dx, dy) = (sm[i].0 - sm[i - 1].0, sm[i].1 - sm[i - 1].1);
+            let nd = (dx * dx + dy * dy).sqrt();
+            let od = ((src[i].0 - src[i - 1].0).powi(2) + (src[i].1 - src[i - 1].1).powi(2)).sqrt();
+            let (ux, uy) = if nd > 1e-12 {
+                (dx / nd, dy / nd)
+            } else {
+                (0.0, 0.0)
+            };
+            let prev = *chain.last().unwrap();
+            let cand = (prev.0 + ux * od, prev.1 + uy * od);
+            // 围栏守卫：重构点/连线段出界则回退原始位置（原轨迹保证界内）
+            let ok = net.boundaries.is_empty()
+                || (route_planner::boundary::contains(&net.boundaries, Coord::new(cand.1, cand.0))
+                    && route_planner::boundary::segment_inside(
+                        &net.boundaries,
+                        Coord::new(prev.1, prev.0),
+                        Coord::new(cand.1, cand.0),
+                    ));
+            chain.push(if ok { cand } else { src[i] });
+        }
+        for (i, p) in locs.iter_mut().enumerate() {
+            p.gLat = chain[i].0;
+            p.gLng = chain[i].1;
+        }
+    }
+
+    // ===== 真机 GPS 漂移弧施加（滤波后）=====
+    // 法向渐进偏移；弧上点与相邻点的连线段须在校园围栏内（真机漂移不
+    // 穿出学校边界渲染范围），出界弧整体放弃。
+    for (k0, m, amp, left) in &drift_arcs {
+        let (dx, dy) = (
+            (locs[*k0 + 1].gLng - locs[*k0].gLng) * 85_200.0,
+            (locs[*k0 + 1].gLat - locs[*k0].gLat) * 111_132.0,
+        );
+        let dl = (dx * dx + dy * dy).sqrt();
+        if dl < 1e-6 {
+            continue;
+        }
+        // 行进方向 (dx,dy) 旋转 ±90° 得法向
+        let (nx0, ny0) = if *left { (-dy, dx) } else { (dy, -dx) };
+        let (nx, ny) = (nx0 / dl, ny0 / dl);
+        let mut ok = true;
+        let mut offs = Vec::with_capacity(*m);
+        for j in 1..=*m {
+            let tt = j as f64 / (*m + 1) as f64;
+            offs.push(amp * (std::f64::consts::PI * tt).sin());
+        }
+        let mut pts = Vec::with_capacity(*m);
+        for (j, &off) in offs.iter().enumerate() {
+            let idx = *k0 + j;
+            pts.push((
+                locs[idx].gLat + nx * off / 111_132.0,
+                locs[idx].gLng + ny * off / 85_200.0,
+            ));
+        }
+        // 出界 fallback：换另一侧法向重算（法向 ± 互为镜像，位移一致）
+        let mut pts_alt = Vec::with_capacity(pts.len());
+        if !net.boundaries.is_empty() {
+            for (j, &off) in offs.iter().enumerate() {
+                let idx = *k0 + j;
+                pts_alt.push((
+                    locs[idx].gLat - nx * off / 111_132.0,
+                    locs[idx].gLng - ny * off / 85_200.0,
+                ));
+            }
+        }
+        if !net.boundaries.is_empty() {
+            for (j, pt) in pts.iter().enumerate() {
+                let idx = *k0 + j;
+                let pa = if j == 0 {
+                    (locs[*k0].gLat, locs[*k0].gLng)
+                } else {
+                    pts[j - 1]
+                };
+                let pb = if j + 1 < pts.len() {
+                    pts[j + 1]
+                } else if idx + 1 < locs.len() {
+                    (locs[idx + 1].gLat, locs[idx + 1].gLng)
+                } else {
+                    *pt
+                };
+                if !route_planner::boundary::segment_inside(
+                    &net.boundaries,
+                    Coord::new(pa.1, pa.0),
+                    Coord::new(pt.1, pt.0),
+                ) || !route_planner::boundary::segment_inside(
+                    &net.boundaries,
+                    Coord::new(pt.1, pt.0),
+                    Coord::new(pb.1, pb.0),
+                ) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            // 另一侧法向重试
+            let mut ok2 = true;
+            if !net.boundaries.is_empty() {
+                for (j, pt) in pts_alt.iter().enumerate() {
+                    let idx = *k0 + j;
+                    let pa = if j == 0 {
+                        (locs[*k0].gLat, locs[*k0].gLng)
+                    } else {
+                        pts_alt[j - 1]
+                    };
+                    let pb = if j + 1 < pts_alt.len() {
+                        pts_alt[j + 1]
+                    } else if idx + 1 < locs.len() {
+                        (locs[idx + 1].gLat, locs[idx + 1].gLng)
+                    } else {
+                        *pt
+                    };
+                    if !route_planner::boundary::segment_inside(
+                        &net.boundaries,
+                        Coord::new(pa.1, pa.0),
+                        Coord::new(pt.1, pt.0),
+                    ) || !route_planner::boundary::segment_inside(
+                        &net.boundaries,
+                        Coord::new(pt.1, pt.0),
+                        Coord::new(pb.1, pb.0),
+                    ) {
+                        ok2 = false;
+                        break;
+                    }
+                }
+            }
+            if !ok2 {
+                continue;
+            }
+            for (j, pt) in pts_alt.iter().enumerate() {
+                let idx = *k0 + j;
+                locs[idx].gLat = pt.0;
+                locs[idx].gLng = pt.1;
+            }
+            continue;
+        }
+        for (j, pt) in pts.iter().enumerate() {
+            let idx = *k0 + j;
+            locs[idx].gLat = pt.0;
+            locs[idx].gLng = pt.1;
+        }
+    }
+
+    // ===== 真机停走微段（毛刺链）施加 =====
+    // 时间堆叠同秒 + 坐标微动 + type 覆盖 + count 乱跳/冻结 + 后续时间轴
+    // 平移（真人 12d342f6：5 点挤同秒，总时长 = 点数×平均间隔 - 堆叠节省）。
+    // totalDis 冻结由 rederive 的 dt==0 分支从时间轴自然识别。
+    {
+        for (s0, e0, types_w) in &walk_stops {
+            let t_stack = locs[*s0].totalTime + 1;
+            let orig_span = locs[*e0].totalTime - t_stack;
+            let old_ts: Vec<i64> = locs.iter().map(|p| p.totalTime).collect();
+            let mut pl = (locs[*s0].gLat, locs[*s0].gLng);
+            let mut brg = rng.uniform(0.0, 360.0).to_radians();
+            for (j, k) in (*s0 + 1..=*e0).enumerate() {
+                let step = if rng.random() < 0.4 { 0.0 } else { rng.uniform(0.5, 3.0) };
+                brg += rng.uniform(-40.0, 40.0).to_radians(); // 原地小转，方向缓变
+                let cand0 = (
+                    pl.0 + step * brg.cos() / 111_132.0,
+                    pl.1 + step * brg.sin() / 85_200.0,
+                );
+                // 围栏守卫：步进连线段出界则反向；反向仍出界则终止链
+                let ok0 = net.boundaries.is_empty()
+                    || route_planner::boundary::segment_inside(
+                        &net.boundaries,
+                        Coord::new(pl.1, pl.0),
+                        Coord::new(cand0.1, cand0.0),
+                    );
+                if ok0 {
+                    pl = cand0;
+                } else {
+                    let brg2 = brg + std::f64::consts::PI;
+                    let cand1 = (
+                        pl.0 + step * brg2.cos() / 111_132.0,
+                        pl.1 + step * brg2.sin() / 85_200.0,
+                    );
+                    let ok1 = net.boundaries.is_empty()
+                        || route_planner::boundary::segment_inside(
+                            &net.boundaries,
+                            Coord::new(pl.1, pl.0),
+                            Coord::new(cand1.1, cand1.0),
+                        );
+                    if !ok1 {
+                        break;
+                    }
+                    pl = cand1;
+                }
+                let drift = locs[k].gainTimeMs - (start_ms + old_ts[k] * 1000);
+                let prev_steps = locs[k - 1].steps;
+                let p = &mut locs[k];
+                p.gLat = pl.0;
+                p.gLng = pl.1;
+                p.ptype = types_w[j];
+                p.totalTime = t_stack;
+                p.validTime = t_stack;
+                p.gainTimeMs = start_ms + t_stack * 1000 + drift;
+                p.gainTime = super::geom::fmt_gain_time(p.gainTimeMs);
+                // 停走步数骤降（max 保底累计单调）+ count 乱跳（真人 -12/+16）
+                p.steps = prev_steps.max(p.steps);
+                p.count = (rng.uniform(14.0, 48.0)).round() as i64;
+            }
+            // 停走恢复点：真人收尾 +3s 内位移 2.8m（0.93 m/s），不产生
+            // 1 秒内大位移的高速点对（盲查 top3 指纹）
+            let rec_t = t_stack + (rng.uniform(2.0, 4.0)) as i64;
+            let k1 = *e0 + 1;
+            if k1 < locs.len() {
+                let drift = locs[k1].gainTimeMs - (start_ms + old_ts[k1] * 1000);
+                let shrink = rng.uniform(1.0, 3.0);
+                let (dlat, dlng) = (locs[*e0].gLat, locs[*e0].gLng);
+                let cur = (locs[k1].gLat, locs[k1].gLng);
+                let dd = ((cur.0 - dlat) * 111_132.0)
+                    .hypot((cur.1 - dlng) * 85_200.0)
+                    .max(1e-6);
+                let f = (shrink / dd).min(1.0);
+                let p = &mut locs[k1];
+                p.gLat = dlat + (cur.0 - dlat) * f;
+                p.gLng = dlng + (cur.1 - dlng) * f;
+                p.totalTime = rec_t;
+                p.validTime = rec_t;
+                p.gainTimeMs = start_ms + rec_t * 1000 + drift;
+                p.gainTime = super::geom::fmt_gain_time(p.gainTimeMs);
+            }
+            // 后续时间轴均摊：毛刺段压缩省下的时间摊回后续间隔
+            // （真人末点 totalTime = dur 不变；毛刺后平均间隔 5.0 -> ~5.1s，
+            // 与真人 233 点均值 5.11s 的形态一致）
+            let shift = orig_span - 1;
+            let tail = locs.len() - 1 - (k1 + 1);
+            if shift > 0 && tail > 0 {
+                for k in (k1 + 1)..locs.len() {
+                    // 靠近毛刺段的点多扣，越靠后越接近原网格 -> 末点 totalTime
+                    // 恢复 = dur（真人毛刺轨迹末点 1207 = 点数×平均间隔不缩水）
+                    let give_back = shift * (k - (*e0 + 1)) as i64 / tail as i64;
+                    let drift = locs[k].gainTimeMs - (start_ms + old_ts[k] * 1000);
+                    locs[k].totalTime -= shift - give_back;
+                    locs[k].validTime -= shift - give_back;
+                    locs[k].gainTimeMs = start_ms + locs[k].totalTime * 1000 + drift;
+                    locs[k].gainTime = super::geom::fmt_gain_time(locs[k].gainTimeMs);
+                }
+            }
+        }
+        if let Some(last) = locs.last() {
+            t_acc = last.totalTime as f64;
+        }
     }
 
     // 真机 bdD = 当前移动方向（ forthcoming 位移方位, 含抖动）+ 轻噪声;

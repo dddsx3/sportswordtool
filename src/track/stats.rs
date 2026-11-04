@@ -44,7 +44,7 @@ fn window_boundaries(total_time_s: i64, seed: u64) -> (i64, Vec<i64>) {
     let mut out = Vec::new();
     while acc < total_ms {
         // 真机计时器窗口精确 10.00s + 毫秒级漂移（真人 18-56 unique 值）
-        acc += 10_000 + (rng.gauss(0.0, 5.0) as i64);
+        acc += 10_000 + (rng.gauss(0.0, 80.0) as i64);
         if acc > total_ms - 1500 {
             acc = total_ms;
         }
@@ -100,10 +100,30 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
     // 逐点 avgSpeed/speed(配速)
     let mut prev_t = 0i64;
     let mut prev_d = 0.0f64;
-    // 真机 avgSpeed 是滤波流（EMA α≈0.45：对原始位移 r≈0.63/斜率≈0.43），
-    // 非逐点精确值——过度精确本身是合成指纹
-    let mut ema = 1.6f64;
+    // avgSpeed = 精确逐点位移速度（终审：raw exact r=1.000）。
+    // speed = 16.6667/avgSpeed_raw（未舍入）——真人精确成立（残差 std 0.02，
+    // corr -0.96），除法爆炸值（停走毛刺 av 0.002-0.8 -> speed 21-8333）即毛刺形态。
     for (i, p) in track.locations.iter_mut().enumerate() {
+        // 真机停走堆叠点（毛刺链）：totalTime 停在同一秒 -> 计时暂停，
+        // totalDis/validDis 冻结；avgSpeed 为设备 1s 窗瞬时值（0.002-0.8），
+        // speed=16.6667/av_raw 除法爆炸（21-8333）。真人 12d342f6 idx59-62。
+        if p.totalTime == prev_t && i > 1 && p.ptype != 5 {
+            p.totalDis = prev_d;
+            p.validDis = prev_d;
+            // 真人毛刺 av 偏高段为主（0.3-0.8），av<0.15 稀少 -> 70/30 混合
+            let av_raw = if rng.random() < 0.70 {
+                rng.uniform(0.30, 0.80)
+            } else {
+                rng.uniform(0.002, 0.30)
+            };
+            p.avgSpeed = round_to(av_raw, 2);
+            p.speed = if p.ptype == -1 {
+                0.0
+            } else {
+                round_to((16.6667 / av_raw).min(9000.0), 2)
+            };
+            continue; // prev_t/prev_d 不更新（同秒堆叠）
+        }
         let dt = (p.totalTime - prev_t).max(1) as f64;
         let inst = (p.totalDis - prev_d) / dt;
         if i <= 1 || p.ptype == 5 {
@@ -116,7 +136,7 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
         p.speed = if p.ptype == -1 {
             0.0
         } else {
-            round_to((16.6667 / ema.max(0.05)).min(4000.0), 2)
+            round_to((16.6667 / inst.max(0.002)).min(9000.0), 2)
         };
         prev_t = p.totalTime;
         prev_d = p.totalDis;
@@ -132,8 +152,10 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
     let mut rad_var = radius_base;
     for (i, p) in track.locations.iter_mut().enumerate() {
         p.radius = if cold_start && i < n_cold {
+            // 真人冷启动收敛差值无规律（盲查 0.02-1.49）：指数收敛+随机抖动
             let f = i as f64 / n_cold.max(1) as f64;
-            round_to(56.0 * (1.0 - f) + radius_base * f, 6)
+            let base = 56.0 * (1.0 - f) + radius_base * f;
+            round_to((base + rng.gauss(0.0, 2.5)).max(radius_base), 6)
         } else if wandering {
             rad_var = (rad_var + rng.gauss(0.0, 0.55)).clamp(3.0, 5.2);
             round_to(rad_var, 6)
@@ -145,7 +167,8 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
     let mut bd_prev = 1.2f64;
     for p in track.locations.iter_mut() {
         let cur = p.avgSpeed;
-        p.bdS = round_to((bd_prev * rng.uniform(0.96, 1.04)).max(0.0), 2);
+        // 真人 bdS 场最大 2.24-3.63 m/s（盲查 12/12 分离）：钳到 3.6
+        p.bdS = round_to((bd_prev * rng.uniform(0.96, 1.04)).max(0.0).min(3.55), 2);
         bd_prev = bd_prev * 0.4 + cur * 0.6;
     }
     // 首点冷启动语义（真机 p0.totalDis 中位 1.6m 且 validDis==totalDis）
@@ -251,6 +274,9 @@ pub fn rebuild(track: &mut Track) {
         super::geom::Rng::new(track.startTime as u64 ^ 0x5E_ED_5E_ED).uniform(0.9930, 0.9980);
     let mut prev_ms = t0;
     let mut prev_seg_s = 0i64;
+    let flag_sec = ((track.startTime as f64) / 1000.0).floor() as i64;
+    // 真人首段 15-18s（覆盖启动段+首窗），其余段与窗口边界一致
+    let mut first_seg_hi = 13 + (super::geom::Rng::new(track.startTime as u64 ^ 0xF1_57).uniform(0.0, 5.0)) as i64;
     for &hi_ms in &boundaries {
         let current = counters_at_f64(&track.locations, hi_ms as f64 / 1000.0);
         let coord_now = coord_at(&track.locations, &coord_cum, hi_ms as f64 / 1000.0);
@@ -267,8 +293,16 @@ pub fn rebuild(track: &mut Track) {
             time: hi_ms - prev_ms,
             value: steps,
         });
-        // segment：真人与窗口一一对应，但边界取整秒（链式衔接保证首尾相接）
-        let seg_hi_s = ((hi_ms + 500) / 1000).max(prev_seg_s + 1);
+        // segment：真人与窗口一一对应，边界为绝对 epoch 秒
+        // （真人 seg.startTime = flag 对齐秒 ±2s，首段 15-18s）
+        let mut seg_hi_s = ((hi_ms + 500) / 1000).max(prev_seg_s + 1);
+        if prev_seg_s == 0 && first_seg_hi > seg_hi_s {
+            seg_hi_s = first_seg_hi;
+        }
+        first_seg_hi = 0;
+        // 顺延不得越过总时长（短轨迹 cap；totalTime 单位为秒）
+        let total_s = track.locations.last().map(|p| p.totalTime).unwrap_or(0);
+        seg_hi_s = seg_hi_s.min(total_s).max(prev_seg_s + 1);
         let seg_lo_s = prev_seg_s;
         let seg_dur_s = (seg_hi_s - seg_lo_s).max(1);
         let seg_dist = coord_at(&track.locations, &coord_cum, seg_hi_s as f64)
@@ -278,10 +312,10 @@ pub fn rebuild(track: &mut Track) {
         track.segments.push(Segment {
             totalTime: seg_dur_s,
             distance: seg_dist,
-            startTime: seg_lo_s * 1000,
-            endTime: seg_hi_s * 1000,
+            startTime: (flag_sec + seg_lo_s) * 1000,
+            endTime: (flag_sec + seg_hi_s) * 1000,
             avgSpeed: if seg_dist > 0.5 {
-                ((seg_dur_s as f64 / 60.0) / (seg_dist / 1000.0)).min(14.6)
+                ((seg_dur_s as f64 / 60.0) / (seg_dist / 1000.0)).min(40.0)
             } else {
                 0.0
             },
@@ -345,8 +379,13 @@ mod tests {
                 t.speedPerTenSec.iter().map(|w| w.time).sum::<i64>(),
                 duration * 1000 - t.window_t0_ms
             );
-            assert_eq!(t.segments[0].startTime, 0);
-            assert_eq!(t.segments.last().unwrap().endTime, duration * 1000);
+            // segment 边界为绝对 epoch（flag 对齐秒起算）
+            let flag_sec = ((t.startTime as f64) / 1000.0).floor() as i64;
+            assert_eq!(t.segments[0].startTime, flag_sec * 1000);
+            assert_eq!(
+                t.segments.last().unwrap().endTime,
+                flag_sec * 1000 + duration * 1000
+            );
             assert_eq!(
                 t.segments
                     .iter()

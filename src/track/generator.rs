@@ -54,6 +54,8 @@ pub fn build(
     points_bd: &[(f64, f64)],
 ) -> Track {
     let mut rng = Rng::new(seed);
+    // 真机 flag=开跑时刻 now_ms：毫秒非零且每条恒定（同 generate_road）
+    let start_ms = start_ms + 13 + (rng.uniform(0.0, 974.0)) as i64;
     let dur_f = dur as f64;
     let (dense, arcs, pc) = make_point_ring(points_bd);
     let (c_lat, c_lng) = pc;
