@@ -365,7 +365,10 @@ fn build_road_inner(
     }
     // 真机到点即停：路线规划多绕一段尾巴（60-400m），采样只走到
     // dist 附近即止（终点距起点 100-500m，与真人一致）
-    let walk_dist = dist + 4.0;
+    // 几何预算：目标 totalDis = dist，真人 totalDis/几何 = 0.997 且漂移弧
+    // 预检失败/恢复点收缩会白扣 20-45m 弧长 —— 预算 +40m 让重定标 k < 1
+    // （此前 k=1.019 是生成指纹：totalDis 反超几何）
+    let walk_dist = dist + 25.0;
     // 路线范围约束: 只用打卡点附近 ±450m 的路网节点
     // （防止游走跑出校园范围 — 真人在校园内跑步不会跑出校门）
     let min_lat = required.iter().map(|p| p.0).fold(f64::MAX, f64::min) - 0.004;
@@ -486,6 +489,8 @@ fn build_road_inner(
     // 运动学速度剖面：OU 配速 + 弯道预判刹车 + 精确命中目标距离
     let kin = KinParams {
         a_c_max,
+        // 真人中段 avgSpeed CV 0.105：默认 σ0.06（稳态 CV≈0.23）过强
+        sigma: 0.045,
         ..Default::default()
     };
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -730,7 +735,14 @@ fn build_road_inner(
             {
                 continue;
             }
-            sprints.push((s1, e1, rng.uniform(1.5, 1.7)));
+            // 真人 min pace 分布：多数条 ~6'00"（倍率 1.5-1.75），少数冲到
+            // 4'30"（倍率 1.9-2.3）—— 70/30 混合
+            let mult = if rng.random() < 0.70 {
+                rng.uniform(1.5, 1.75)
+            } else {
+                rng.uniform(1.9, 2.3)
+            };
+            sprints.push((s1, e1, mult));
         }
     }
     let sprint_seg: f64 = sprints
@@ -776,13 +788,14 @@ fn build_road_inner(
         })
         .collect();
     let cadence_seed = seed.wrapping_add(0xC6A4_A793_5BD1_E995);
-    // 窗口步数 CV 校准：真人 0.070-0.166（中位 0.10）；sigma 决定窗间波动
-    let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.10, 2.5, 120.0, 236.0);
+    // 窗口步数 CV 校准：真人窗级 CV 0.106、单条 103-192（盲查/App 截图
+    // 柱状高低交错）；σ=3.0 给稳态 ±15 spm，clamp 下限 100
+    let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.10, 4.2, 100.0, 236.0);
 
     // GPS 抖动：AR(1) 相关漂移为主，独立测量噪声极小。
     // 真机 App 存的轨迹是**滤波后**的：横向偏离是 50-200m 尺度的缓慢漂移，
     // 不是逐点锯齿。alpha=0.96（时间常数 ~25 采样） + sigma_meas=0.04。
-    let mut jitter = GpsJitter::new(0.96, rng.uniform(0.50, 0.72), 0.04);
+    let mut jitter = GpsJitter::new(0.96, rng.uniform(0.38, 0.55), 0.04);
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut positions = Vec::with_capacity(n);
@@ -1183,10 +1196,15 @@ fn build_road_inner(
             let t_stack = locs[*s0].totalTime + 1;
             let orig_span = locs[*e0].totalTime - t_stack;
             let old_ts: Vec<i64> = locs.iter().map(|p| p.totalTime).collect();
+            let old_steps_e0 = locs[*e0].steps;
             let mut pl = (locs[*s0].gLat, locs[*s0].gLng);
             let mut brg = rng.uniform(0.0, 360.0).to_radians();
             for (j, k) in (*s0 + 1..=*e0).enumerate() {
-                let step = if rng.random() < 0.4 { 0.0 } else { rng.uniform(0.5, 3.0) };
+                let step = if rng.random() < 0.4 {
+                    0.0
+                } else {
+                    rng.uniform(0.5, 3.0)
+                };
                 brg += rng.uniform(-40.0, 40.0).to_radians(); // 原地小转，方向缓变
                 let cand0 = (
                     pl.0 + step * brg.cos() / 111_132.0,
@@ -1229,8 +1247,17 @@ fn build_road_inner(
                 p.gainTimeMs = start_ms + t_stack * 1000 + drift;
                 p.gainTime = super::geom::fmt_gain_time(p.gainTimeMs);
                 // 停走步数骤降（max 保底累计单调）+ count 乱跳（真人 -12/+16）
-                p.steps = prev_steps.max(p.steps);
+                // 真人毛刺窗步频不塌（≥102 spm，count 22-38 乱跳但不归零）
+                p.steps = prev_steps + (rng.uniform(10.0, 18.0)) as i64;
                 p.count = (rng.uniform(14.0, 48.0)).round() as i64;
+            }
+            // 毛刺 steps 增量同步：毛刺点的抬升量对后续全部点补齐，
+            // 否则采样累计的 steps 会小于毛刺点（倒退指纹）
+            let step_bump = locs[*e0].steps - old_steps_e0;
+            if step_bump > 0 {
+                for k in (*e0 + 1)..locs.len() {
+                    locs[k].steps += step_bump;
+                }
             }
             // 停走恢复点：真人收尾 +3s 内位移 2.8m（0.93 m/s），不产生
             // 1 秒内大位移的高速点对（盲查 top3 指纹）
@@ -1265,7 +1292,11 @@ fn build_road_inner(
                     let give_back = shift * (k - (*e0 + 1)) as i64 / tail as i64;
                     let drift = locs[k].gainTimeMs - (start_ms + old_ts[k] * 1000);
                     locs[k].totalTime -= shift - give_back;
-                    locs[k].validTime -= shift - give_back;
+                    // 恢复点后间隔 ≥4s：均摊首点被拉到 rec_t 以下会倒退
+                    // （floor 只对紧邻恢复点的前 3 个点有意义，避免无界抬升）
+                    let floor_t = rec_t + ((k - k1) as i64 * 4).min(12);
+                    locs[k].totalTime = locs[k].totalTime.max(floor_t);
+                    locs[k].validTime = locs[k].totalTime;
                     locs[k].gainTimeMs = start_ms + locs[k].totalTime * 1000 + drift;
                     locs[k].gainTime = super::geom::fmt_gain_time(locs[k].gainTimeMs);
                 }

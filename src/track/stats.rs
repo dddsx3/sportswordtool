@@ -31,7 +31,8 @@ pub fn counters_at(locs: &[GenPoint], time: i64) -> (f64, i64) {
 
 /// NEUQ 真人窗口形态（33 条实测）：中位 10.0s，9.3-12s 为主，停顿合并出
 /// 最长 36s；窗口数 = 时长/10 上下。这里用「10s 基准 + 小抖动 + 偶发停顿合并」
-/// 生成毫秒级窗口边界，末窗吸收余量。
+/// 生成毫秒级窗口边界；末窗恒为完整 10s（真人实测 9.995-10.007s），窗口和
+/// 可比 totalTime 多 1-21s 或少 3.5s（真人 overrun 双向分布）。
 fn window_boundaries(total_time_s: i64, seed: u64) -> (i64, Vec<i64>) {
     use super::geom::Rng;
     let mut rng = Rng::new(seed);
@@ -43,22 +44,17 @@ fn window_boundaries(total_time_s: i64, seed: u64) -> (i64, Vec<i64>) {
     acc = t0;
     let mut out = Vec::new();
     while acc < total_ms {
-        // 真机计时器窗口精确 10.00s + 毫秒级漂移（真人 18-56 unique 值）
-        acc += 10_000 + (rng.gauss(0.0, 80.0) as i64);
-        if acc > total_ms - 1500 {
-            acc = total_ms;
-        }
+        // 真机窗长精确 10.00s ± 7ms（真人 p5=9.986/p95=10.014、末窗
+        // 9.995-10.007——窗长锁死，beginTime 的大间隔抖动只来自停顿合并窗）
+        acc += 10_000 + (rng.uniform(-7.0, 7.0)) as i64;
         out.push(acc);
         if acc >= total_ms {
             break;
         }
     }
-    if out.last() != Some(&total_ms) {
-        if let Some(last) = out.last_mut() {
-            *last = total_ms;
-        } else {
-            out.push(total_ms);
-        }
+    if out.is_empty() {
+        // 极短轨迹兜底（真人不存在此形态，仅保证不崩）
+        out.push((t0 + 10_000).max(total_ms));
     }
     (t0, out)
 }
@@ -103,6 +99,46 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
     // avgSpeed = 精确逐点位移速度（终审：raw exact r=1.000）。
     // speed = 16.6667/avgSpeed_raw（未舍入）——真人精确成立（残差 std 0.02，
     // corr -0.96），除法爆炸值（停走毛刺 av 0.002-0.8 -> speed 21-8333）即毛刺形态。
+    // 慢尾钳制前置计算：真人逐点 pace p95=12.22 min/km（位移 1.36 m/s），
+    // 抖动下探被取倒数放大（生成 p95=14.31）——App 侧滤波语义：瞬时速度
+    // 不低于局部均值（±5 点）的 0.72 倍。只钳下尾：快跑窗/漂移弧的上尾
+    // （3.4-3.9 m/s，min pace 4.30-6.71）是真人真实形态。
+    let n_loc = track.locations.len();
+    let mut insts = vec![f64::NAN; n_loc];
+    {
+        let mut pt = 0i64;
+        let mut pd = 0.0f64;
+        for (i, p) in track.locations.iter().enumerate() {
+            if i <= 1 || p.ptype == 5 {
+                pt = p.totalTime;
+                pd = p.totalDis;
+                continue;
+            }
+            if p.totalTime == pt {
+                continue; // 毛刺堆叠点无独立 inst
+            }
+            let dt = (p.totalTime - pt).max(1) as f64;
+            insts[i] = (p.totalDis - pd) / dt;
+            pt = p.totalTime;
+            pd = p.totalDis;
+        }
+    }
+    let mut local_avg = vec![0.0f64; n_loc];
+    for i in 0..n_loc {
+        let mut s = 0.0;
+        let mut c = 0;
+        let lo = i.saturating_sub(5);
+        let hi = (i + 5).min(n_loc - 1);
+        for j in lo..=hi {
+            if insts[j].is_finite() {
+                s += insts[j];
+                c += 1;
+            }
+        }
+        if c > 0 {
+            local_avg[i] = s / c as f64;
+        }
+    }
     for (i, p) in track.locations.iter_mut().enumerate() {
         // 真机停走堆叠点（毛刺链）：totalTime 停在同一秒 -> 计时暂停，
         // totalDis/validDis 冻结；avgSpeed 为设备 1s 窗瞬时值（0.002-0.8），
@@ -125,7 +161,12 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
             continue; // prev_t/prev_d 不更新（同秒堆叠）
         }
         let dt = (p.totalTime - prev_t).max(1) as f64;
-        let inst = (p.totalDis - prev_d) / dt;
+        let raw = (p.totalDis - prev_d) / dt;
+        let inst = if raw.is_finite() && local_avg[i] > 0.3 {
+            raw.max(0.80 * local_avg[i])
+        } else {
+            raw
+        };
         if i <= 1 || p.ptype == 5 {
             prev_t = p.totalTime;
             prev_d = p.totalDis;
@@ -150,14 +191,19 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
     let wandering = !cold_start && style < 0.50;
     let n_cold = (rng.uniform(3.0, 7.0)) as usize;
     let mut rad_var = radius_base;
+    let radius_block = 8 + (rng.uniform(0.0, 22.0)) as usize;
     for (i, p) in track.locations.iter_mut().enumerate() {
+        // 真人 radius 变化型只有 1-24 个取值（每值持续 8-30 点），
+        // 逐点高斯会产生 200+ 唯一值 -> 块状重采样
+        if wandering && i % radius_block == 0 {
+            rad_var = (rad_var + rng.gauss(0.0, 0.9)).clamp(3.0, 7.5);
+        }
         p.radius = if cold_start && i < n_cold {
             // 真人冷启动收敛差值无规律（盲查 0.02-1.49）：指数收敛+随机抖动
             let f = i as f64 / n_cold.max(1) as f64;
             let base = 56.0 * (1.0 - f) + radius_base * f;
             round_to((base + rng.gauss(0.0, 2.5)).max(radius_base), 6)
         } else if wandering {
-            rad_var = (rad_var + rng.gauss(0.0, 0.55)).clamp(3.0, 5.2);
             round_to(rad_var, 6)
         } else {
             radius_base
@@ -268,15 +314,41 @@ pub fn rebuild(track: &mut Track) {
         *cum.last().unwrap_or(&0.0)
     };
     let mut previous = (0.0f64, 0.0f64);
-    let mut prev_coord = 0.0f64;
+    // 窗链坐标差从 t0 起（与闭合基准一致；真人窗链亦不含 t0 前的启动段）
+    let mut prev_coord = coord_at(&track.locations, &coord_cum, t0 as f64 / 1000.0);
     // 真人窗口/段距离和 ≈ 0.9956×totalDis（略少）——每跑常数因子
-    let window_factor =
-        super::geom::Rng::new(track.startTime as u64 ^ 0x5E_ED_5E_ED).uniform(0.9930, 0.9980);
+    // 真人窗和/totalDis = 0.9956 [0.987, 1.000]（从不 >1）。几何 G 因
+    // 漂移弧/毛刺白扣而浮动 → 固定 factor 会越界；改为按全程坐标差
+    // 精确闭合：窗和 = ratio × totalDistance
+    let win_ratio =
+        super::geom::Rng::new(track.startTime as u64 ^ 0x5E_ED_5E_ED).uniform(0.9870, 0.9990);
+    let coord_span_total = coord_at(
+        &track.locations,
+        &coord_cum,
+        track.locations.last().map(|p| p.totalTime).unwrap_or(0) as f64,
+    ) - coord_at(&track.locations, &coord_cum, t0 as f64 / 1000.0);
+    // 闭合基准 = 末点 totalDis（真实坐标累计；totalDistance 字段在测试
+    // 合成轨迹里可能与 locations 脱节）
+    let closed_base = track.locations.last().map(|p| p.totalDis).unwrap_or(0.0);
+    let window_factor = if coord_span_total > 1.0 && closed_base > 1.0 {
+        win_ratio * closed_base / coord_span_total
+    } else {
+        1.0
+    };
+    // 段和略高于窗和 0.4%（真人 0.9992 vs 0.9956）
+    let seg_ratio =
+        super::geom::Rng::new(track.startTime as u64 ^ 0x5E_6_5E6).uniform(0.9930, 0.9995);
+    let seg_factor_total = if coord_span_total > 1.0 && closed_base > 1.0 {
+        seg_ratio * closed_base / coord_span_total
+    } else {
+        1.0
+    };
     let mut prev_ms = t0;
     let mut prev_seg_s = 0i64;
     let flag_sec = ((track.startTime as f64) / 1000.0).floor() as i64;
     // 真人首段 15-18s（覆盖启动段+首窗），其余段与窗口边界一致
-    let mut first_seg_hi = 13 + (super::geom::Rng::new(track.startTime as u64 ^ 0xF1_57).uniform(0.0, 5.0)) as i64;
+    let mut first_seg_hi =
+        13 + (super::geom::Rng::new(track.startTime as u64 ^ 0xF1_57).uniform(0.0, 5.0)) as i64;
     for &hi_ms in &boundaries {
         let current = counters_at_f64(&track.locations, hi_ms as f64 / 1000.0);
         let coord_now = coord_at(&track.locations, &coord_cum, hi_ms as f64 / 1000.0);
@@ -300,13 +372,18 @@ pub fn rebuild(track: &mut Track) {
             seg_hi_s = first_seg_hi;
         }
         first_seg_hi = 0;
-        // 顺延不得越过总时长（短轨迹 cap；totalTime 单位为秒）
+        // 真人末段同样超 totalTime（末窗完整 10s 的链式结果），不做 cap；
+        // 极短轨迹（total_s < 首段顺延）时钳回边界内避免空窗
         let total_s = track.locations.last().map(|p| p.totalTime).unwrap_or(0);
-        seg_hi_s = seg_hi_s.min(total_s).max(prev_seg_s + 1);
+        if total_s < first_seg_hi && prev_seg_s == 0 {
+            seg_hi_s = seg_hi_s.min(total_s).max(prev_seg_s + 1);
+        }
         let seg_lo_s = prev_seg_s;
         let seg_dur_s = (seg_hi_s - seg_lo_s).max(1);
-        let seg_dist = coord_at(&track.locations, &coord_cum, seg_hi_s as f64)
-            - coord_at(&track.locations, &coord_cum, seg_lo_s as f64);
+        // 段和 = seg_ratio × totalDistance（精确闭合）
+        let seg_dist = (coord_at(&track.locations, &coord_cum, seg_hi_s as f64)
+            - coord_at(&track.locations, &coord_cum, seg_lo_s as f64))
+            * seg_factor_total;
         let seg_cur = counters_at_f64(&track.locations, seg_hi_s as f64);
         let seg_prev = counters_at_f64(&track.locations, seg_lo_s as f64);
         track.segments.push(Segment {
@@ -375,23 +452,30 @@ mod tests {
                 "sum={}",
                 t.speedPerTenSec.iter().map(|w| w.value).sum::<f64>()
             );
-            assert_eq!(
-                t.speedPerTenSec.iter().map(|w| w.time).sum::<i64>(),
-                duration * 1000 - t.window_t0_ms
+            // 末窗恒为完整 10s：窗和 = 末边界 - t0 ≥ totalTime（真人 overrun
+            // 双向，最大 +21s）
+            let win_sum = t.speedPerTenSec.iter().map(|w| w.time).sum::<i64>();
+            assert!(
+                win_sum >= duration * 1000 - t.window_t0_ms
+                    && win_sum < duration * 1000 - t.window_t0_ms + 12_000,
+                "win_sum={win_sum}"
             );
-            // segment 边界为绝对 epoch（flag 对齐秒起算）
+            // segment 边界为绝对 epoch（flag 对齐秒起算）；末段跟随末窗，
+            // 可超出 totalTime（真人 12d342f6：末段 end 超 +21s）
             let flag_sec = ((t.startTime as f64) / 1000.0).floor() as i64;
             assert_eq!(t.segments[0].startTime, flag_sec * 1000);
-            assert_eq!(
-                t.segments.last().unwrap().endTime,
-                flag_sec * 1000 + duration * 1000
+            assert!(
+                t.segments.last().unwrap().endTime >= flag_sec * 1000 + duration * 1000,
+                "seg end {}",
+                t.segments.last().unwrap().endTime
             );
-            assert_eq!(
+            assert!(
                 t.segments
                     .iter()
                     .map(|s| s.endTime - s.startTime)
-                    .sum::<i64>(),
-                duration * 1000
+                    .sum::<i64>()
+                    >= duration * 1000,
+                "seg sum"
             );
         }
     }

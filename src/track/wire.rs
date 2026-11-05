@@ -51,7 +51,7 @@ pub fn conv_point(p: &GenPoint, start_ms: i64, idx: usize) -> Value {
     json!({
         "avgSpeed": round_to(p.avgSpeed, 2),
         "bdA": round_to(p.bdA, 2),
-        "bdD": round_to(p.bdD, 1),
+        "bdD": round_to(p.bdD, 2),
         "bdG": p.bdG,
         "bdS": round_to(p.bdS, 2),
         "coorType": "gcj02",
@@ -593,8 +593,18 @@ mod regression_tests {
         // startTime 带真机毫秒偏移（flag=now_ms），窗口时刻相对 startTime
         let st = lt.startTime;
         let (speed, steps) = build_windows(&lt, 60);
-        assert_eq!(speed.last().unwrap()["endTime"], st + 603000);
-        assert!(speed.last().unwrap()["beginTime"].as_i64().unwrap() < st + 603000);
+        // 末窗恒完整 10s：末窗终点可超 totalTime（真人 overrun 实测），
+        // 末窗时长落在 10.00s ± 毫秒抖动
+        let last_end = speed.last().unwrap()["endTime"].as_i64().unwrap();
+        let last_begin = speed.last().unwrap()["beginTime"].as_i64().unwrap();
+        assert!(
+            last_end >= st + 603000 && last_end <= st + 603000 + 12_000,
+            "last_end={last_end}"
+        );
+        assert!(
+            (last_end - last_begin - 10_000).abs() <= 10,
+            "last window must be full"
+        );
         // 真机 speed/steps 的 queueNum 各自独立 0..N-1（盲查实测步长 1）
         assert_eq!(speed[0]["queueNum"], 0);
         assert_eq!(speed[1]["queueNum"], 1);

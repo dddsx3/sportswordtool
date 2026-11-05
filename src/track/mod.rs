@@ -229,7 +229,8 @@ mod tests {
                     }
                     *coord_cum.last().unwrap_or(&0.0)
                 };
-                let mut prev_d = 0.0f64;
+                // 窗链从 t0 起（与 rebuild 闭合基准一致）
+                let mut prev_d = coord_at(t.window_t0_ms as f64 / 1000.0);
                 for w in &t.speedPerTenSec {
                     let hi_ms = lo_ms + w.time;
                     // 窗口值 = 坐标差 × 独立滤波流偏差（0.9-1.1 倍，真机语义）
@@ -244,7 +245,12 @@ mod tests {
                     assert!((1500..=36000).contains(&w.time), "win={}", w.time);
                     lo_ms = hi_ms;
                 }
-                assert_eq!(lo_ms, t.totalTime * 1000);
+                // 末窗完整 10s：窗链累计可超 totalTime（真人 overrun ±21s）
+                assert!(
+                    lo_ms >= t.totalTime * 1000 && lo_ms <= t.totalTime * 1000 + 25_000,
+                    "lo={lo_ms} tt={}",
+                    t.totalTime * 1000
+                );
                 // 坐标累计与标称距离存在亚米-米级自然差（真机同样如此：
                 // 真人 06/10 窗口和 2323.6 vs totalDis 2323.0）
                 assert!(
