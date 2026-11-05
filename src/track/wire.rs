@@ -227,18 +227,34 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
     } else {
         0
     };
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
+    let mut win_jitter_rng = StdRng::seed_from_u64(start_ms as u64 ^ 0x8A_11_17);
+    let mut lo_ms_cur = lo_ms;
     for (k, a) in track.speedPerTenSec.iter().enumerate() {
         let b = &track.stepsPerTenSec[k];
-        let hi_ms = lo_ms + a.time;
+        let hi_ms = lo_ms_cur + a.time;
+        let lo = lo_ms_cur;
         cum_d += a.value;
         cum_s += b.value;
         let id = track.window_id_base + k as i64;
         // 真机 speed/step 的 id 共享窗计数器；queueNum 各自独立 0..N-1
         // （盲查实测：speed.qn 与 steps.qn 均为 0,1,2,... 步长 1）
+        // 真机 beginTime 对齐绝对秒表（10s 定时器，盲测3 指纹 7：毫秒
+        // 尾数集中度 0.37-1.00）——秒对齐 + 恒定微偏移 + 少数窗执行抖动
+        let begin_aligned = if win_jitter_rng.gen::<f64>() < 0.30 {
+            start_ms
+                + (lo / 1000) * 1000
+                + (start_ms % 1000).min(15)
+                + win_jitter_rng.gen_range(0..60)
+        } else {
+            start_ms + (lo / 1000) * 1000 + (start_ms % 1000).min(15)
+        };
         sp.push(json!({
-            "beginTime": start_ms + lo_ms,
+            "beginTime": begin_aligned,
             "distance": a.value,
-            "endTime": start_ms + hi_ms,
+            "endTime": begin_aligned + a.time,
             "flag": start_ms,
             "id": id,
             "queueNum": k as i64,
@@ -248,8 +264,8 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
         let steps_num = cum_s.round() - (cum_s - b.value).round();
         stf.push(json!({
             "avgDiff": 0.0,
-            "beginTime": start_ms + lo_ms,
-            "endTime": start_ms + hi_ms,
+            "beginTime": begin_aligned,
+            "endTime": begin_aligned + a.time,
             "flag": start_ms,
             "id": id,
             "maxDiff": 0.0,
@@ -258,7 +274,7 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
             "state": 0,
             "stepsNum": steps_num as i64,
         }));
-        lo_ms = hi_ms;
+        lo_ms_cur = hi_ms;
     }
     (sp, stf)
 }

@@ -490,6 +490,14 @@ pub fn plan_loop(
 
         let mut path: Vec<NodeIndex> = vec![start];
         let mut cur = start;
+        // 骨架去重：按序串联 + 纯最短路会产出逐像素一致的「尺规」模板
+        // （视觉盲查最强指纹）。跨段记录已用边，每段 30% 概率走带随机
+        // 放大的变体路径（A* 分叉，仍按序到达）。
+        use rand_distr::{Distribution, Uniform};
+        let mut leg_rng = StdRng::seed_from_u64(seed.wrapping_add(0x1E_55_1E_11));
+        let leg_variant = Uniform::new(1.08_f64, 1.28);
+        let leg_p = Uniform::new(0.0_f64, 1.0);
+        let mut used_edges: std::collections::HashSet<usize> = Default::default();
         for (i, &t) in must_pass.iter().enumerate() {
             // 未到的后续打卡点（must_pass[i+1..]）判定圈是禁区：按序打卡下，
             // 路径顺路蹭进后续点范围会被 App 记为提前打卡（跳跃违规）。
@@ -498,12 +506,25 @@ pub fn plan_loop(
             let seg = if future.is_empty() {
                 shortest_path(g, cur, t)
             } else {
+                let variant = leg_p.sample(&mut leg_rng) < 0.30;
+                let leg_scale = if variant {
+                    leg_variant.sample(&mut leg_rng)
+                } else {
+                    1.0
+                };
                 astar(
                     &g.graph,
                     cur,
                     |n| n == t,
                     |e| {
-                        let base_w = e.weight().length_m * road_class_factor(&e.weight().highway);
+                        let mut base_w =
+                            e.weight().length_m * road_class_factor(&e.weight().highway);
+                        if variant {
+                            base_w *= leg_scale;
+                        }
+                        if used_edges.contains(&e.id().index()) {
+                            base_w *= 1.5;
+                        }
                         let (a, b) = g.graph.edge_endpoints(e.id()).unwrap();
                         // 点到线段最近距离：端点贴圈的边同样算入（只查中点会漏掉
                         // 「端点在圈内、中点在圈外」的长边，路径可合法经过距
@@ -527,6 +548,11 @@ pub fn plan_loop(
                 .or_else(|| shortest_path(g, cur, t))
             }
             .ok_or("打卡点之间道路不连通，无法按序串联")?;
+            for w in seg.windows(2) {
+                if let Some(e) = g.graph.find_edge(w[0], w[1]) {
+                    used_edges.insert(e.index());
+                }
+            }
             path.extend(seg.into_iter().skip(1));
             cur = t;
         }
@@ -564,11 +590,23 @@ pub fn plan_loop(
                 let mut rng = StdRng::seed_from_u64(
                     seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1)),
                 );
+                // 40% 概率反向起步（真人折返跑：主路双程重叠宽带）
+                let back_pedal = if rand::Rng::gen_range(
+                    &mut StdRng::seed_from_u64(
+                        seed.wrapping_add(0xBA_C1_1A7).wrapping_add(i as u64 * 7),
+                    ),
+                    0.0..1.0,
+                ) < 0.4
+                {
+                    180.0
+                } else {
+                    0.0
+                };
                 let (ext, walked) = wander_open(
                     g,
                     cur,
                     need,
-                    anchor_deg + i as f64 * 90.0,
+                    anchor_deg + back_pedal + i as f64 * 90.0,
                     &mut rng,
                     opts,
                     &seed_used,

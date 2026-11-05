@@ -98,7 +98,7 @@ mod regression_tests {
         g.add_node(a);
         g.add_node(b);
         g.compute_anchor();
-        assert!(smooth_and_sample(&g, &[a, b], 6.0, 30.0, 0.0).is_empty());
+        assert!(smooth_and_sample(&g, &[a, b], 6.0, 30.0, 0.0, 0).is_empty());
     }
 }
 
@@ -110,6 +110,17 @@ fn push_line(out: &mut Smoothed, from: [f64; 2], to: [f64; 2]) {
 }
 
 fn smooth_polyline(pts: &[[f64; 2]], radius: f64, threshold_rad: f64) -> Smoothed {
+    smooth_polyline_seeded(pts, radius, threshold_rad, 0)
+}
+
+/// 每角圆角半径 ×U(0.6,1.4)（seed=0 退化为恒定半径）：真人转角圆度不均，
+/// 恒定半径完美圆弧是渲染指纹（盲查 b07）。
+fn smooth_polyline_seeded(
+    pts: &[[f64; 2]],
+    radius: f64,
+    threshold_rad: f64,
+    seed: u64,
+) -> Smoothed {
     let mut out = Smoothed {
         pts: vec![],
         k: vec![],
@@ -125,9 +136,19 @@ fn smooth_polyline(pts: &[[f64; 2]], radius: f64, threshold_rad: f64) -> Smoothe
     out.k.push(0.0);
     let mut cursor = pts[0];
     let n = pts.len();
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Uniform};
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0xF1_11_17));
+    let corner_jitter = Uniform::new(0.6_f64, 1.4);
     for i in 1..n - 1 {
         let (a, b, c) = (pts[i - 1], pts[i], pts[i + 1]);
-        match corner_fillet(a, b, c, radius, threshold_rad) {
+        let r_corner = if seed == 0 {
+            radius
+        } else {
+            radius * corner_jitter.sample(&mut rng)
+        };
+        match corner_fillet(a, b, c, r_corner, threshold_rad) {
             Some((cut1, cut2, center, delta)) => {
                 push_line(&mut out, cursor, cut1);
                 // 采样圆弧
@@ -160,12 +181,13 @@ pub fn smooth_and_sample(
     radius: f64,
     threshold_deg: f64,
     step_m: f64,
+    seed: u64,
 ) -> Vec<RoutePoint> {
     if !step_m.is_finite() || step_m <= 0.0 {
         return Vec::new();
     }
     let pts_m: Vec<[f64; 2]> = coords.iter().map(|c| g.to_m(*c)).collect();
-    let sm = smooth_polyline(&pts_m, radius, threshold_deg.to_radians());
+    let sm = smooth_polyline_seeded(&pts_m, radius, threshold_deg.to_radians(), seed);
 
     // 累计弧长
     let mut cum = vec![0.0f64];

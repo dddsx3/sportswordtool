@@ -97,7 +97,14 @@ pub fn plan_route_split(
     )?;
     let coords = route::path_coords(&g, &path);
     let points = if g.boundaries.is_empty() {
-        smooth::smooth_and_sample(&g, &coords, opts.min_radius_m, opts.turn_threshold_deg, 1.0)
+        smooth::smooth_and_sample(
+            &g,
+            &coords,
+            opts.min_radius_m,
+            opts.turn_threshold_deg,
+            1.0,
+            seed,
+        )
     } else {
         // Keep every road corner: smoothing may cut through a concave school boundary.
         if !coords

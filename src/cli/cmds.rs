@@ -633,10 +633,15 @@ fn cmd_track_sample(rest: &[&str]) -> i32 {
 
     let uuid = uuid::Uuid::new_v4().to_string(); // 真机小写
                                                  // 15% 记录整个缺失 laps_json 键
+                                                 // 真人 laps 海拔源（盲测3 指纹 11）：60% 的记录 elevationGain 与
+                                                 // Σmax(ΔbdA,0) 位级一致（bias=0），其余偏差 3-24%（独立气压计源）；
+                                                 // 旧 ±11 全量偏差是「全部不一致」的指纹
     let laps_bias = if seed % 33 == 3 {
         f64::NAN
+    } else if seed % 5 < 3 {
+        0.0
     } else {
-        ((uuid.bytes().map(|b| b as u64).sum::<u64>() % 220) as f64) / 10.0 - 11.0
+        ((uuid.bytes().map(|b| b as u64).sum::<u64>() % 94) as f64) / 10.0 + 1.3
     };
     let obj = crate::track::wire::build_obs_object_with_laps_bias(
         &built,

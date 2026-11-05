@@ -295,12 +295,15 @@ pub fn run_full_flow_cancellable(
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
     let mut track_for_obs = sp.track.clone();
     track_for_obs.startTime = result.start_ms;
-    // 圈爬升独立偏差：真机 laps 用独立气压计/滤波源（与 bdA 差 2-22m）；
+    // 圈爬升源（盲测3 指纹 11）：真人 60% 的记录 elevationGain 与
+    // Σmax(ΔbdA,0) 位级一致（bias=0），其余偏差 3-24%（独立气压计源）；
     // 15% 记录整个缺失 laps_json 键（App 版本行为）
     let laps_bias = if result.uuid.bytes().sum::<u8>() % 33 == 3 {
         f64::NAN
+    } else if result.uuid.bytes().sum::<u8>() % 5 < 3 {
+        0.0
     } else {
-        ((result.uuid.bytes().map(|b| b as u64).sum::<u64>() % 220) as f64) / 10.0 - 11.0
+        ((result.uuid.bytes().map(|b| b as u64).sum::<u64>() % 94) as f64) / 10.0 + 1.3
     };
     // 真机 uuid 全小写（含 OBS 键路径）
     let uuid_lc = result.uuid.to_lowercase();

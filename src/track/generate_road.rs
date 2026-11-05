@@ -504,7 +504,14 @@ fn build_road_inner(
         ROAD_SPEED_FLOOR,
         ROAD_SPEED_CEIL,
     );
-    let speeds: Vec<f64> = w.clone();
+    // 独立测量白噪声：真人速度 lag-1 自相关含负值（-0.27~0.75），
+    // 纯 AR 全正——白噪声打断过强序列相关（disp_of 仍用 w，距离精确命中）
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution as _, Normal};
+    let wn_dist = Normal::new(0.0, 0.12).unwrap();
+    let mut wn_rng = StdRng::seed_from_u64(seed.wrapping_add(0x8E_15_5E_5));
+    let speeds: Vec<f64> = w.iter().map(|v| v + wn_dist.sample(&mut wn_rng)).collect();
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
     let _ = walk_dist;
 
@@ -784,7 +791,8 @@ fn build_road_inner(
             let km_done = (times[i] / dur_f) * dist / 1000.0;
             let shape = gait(speeds[i], fatigue_from_km(km_done)).cadence / gait_median;
             // 步距-距离解耦（真机步频与窗口距离相关仅 0.01-0.37）
-            personal_cadence * (1.0 + (shape - 1.0) * 0.4)
+            // 步数~距离相关（真人 0.067-0.500）：耦合系数 0.4 → 0.7
+            personal_cadence * (1.0 + (shape - 1.0) * 0.9)
         })
         .collect();
     let cadence_seed = seed.wrapping_add(0xC6A4_A793_5BD1_E995);
@@ -795,7 +803,9 @@ fn build_road_inner(
     // GPS 抖动：AR(1) 相关漂移为主，独立测量噪声极小。
     // 真机 App 存的轨迹是**滤波后**的：横向偏离是 50-200m 尺度的缓慢漂移，
     // 不是逐点锯齿。alpha=0.96（时间常数 ~25 采样） + sigma_meas=0.04。
-    let mut jitter = GpsJitter::new(0.96, rng.uniform(0.38, 0.55), 0.04);
+    // 真人渲染边缘有 1-2px 连续 GPS 摆动（盲查 RMS 0.89px ≈ 1.9m）：
+    // 相关漂移 σ 拉回可见量级；纵向速度起伏由 OU 配速承担，不受影响
+    let mut jitter = GpsJitter::new(0.96, rng.uniform(2.2, 3.2), 0.04);
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut positions = Vec::with_capacity(n);
@@ -805,7 +815,13 @@ fn build_road_inner(
     let mut steps_acc = 0.0f64;
     // 海拔：AR(1)（同经典模式，NEUQ 实测口径）
     // 真人 bdA 中位 5.75-9.68（盲查）：初值收窄
-    let mut alt = rng.uniform(2.0, 12.0);
+    // bdA 冷启动收敛（真人 5/16 条：开跑头 8 点海拔从 40-65 掉到正常）
+    let alt_cold = rng.random() < 0.31;
+    let mut alt = if alt_cold {
+        rng.uniform(40.0, 65.0)
+    } else {
+        rng.uniform(2.0, 12.0)
+    };
     let alt_base = alt;
     // 真人海拔形态：缓爬缓降趋势（gain/std=13），AR 趋势项 phi 主导，
     // σ 决定窗口内抖动（真人 alt_std 1.8-9.2 中位 3.4、gain 44.7）
@@ -921,7 +937,13 @@ fn build_road_inner(
         } else {
             0.0
         };
-        alt = alt_phi * alt + (1.0 - alt_phi) * (alt_base + sink) + rng.gauss(0.0, alt_sigma);
+        let alt_phi_eff = if alt_cold && (t_acc < 40.0) {
+            0.80
+        } else {
+            alt_phi
+        };
+        alt =
+            alt_phi_eff * alt + (1.0 - alt_phi_eff) * (alt_base + sink) + rng.gauss(0.0, alt_sigma);
         // 生物力学联动：v=(cad/60)·stride
         let v_now = speeds[i];
         let mut stride = v_now * 60.0 / cadences[i];
@@ -1200,10 +1222,13 @@ fn build_road_inner(
             let mut pl = (locs[*s0].gLat, locs[*s0].gLng);
             let mut brg = rng.uniform(0.0, 360.0).to_radians();
             for (j, k) in (*s0 + 1..=*e0).enumerate() {
-                let step = if rng.random() < 0.4 {
-                    0.0
+                // 真人毛刺链步长双形态（盲测3：同秒点对 1-38.8m）：
+                // 微动 0-3m 与大突刺 5-20m 各半——后者是 k 波动
+                // （0.95-1.005）与轨迹「突刺」视觉的来源
+                let step = if rng.random() < 0.5 {
+                    rng.uniform(0.0, 3.0)
                 } else {
-                    rng.uniform(0.5, 3.0)
+                    rng.uniform(5.0, 20.0)
                 };
                 brg += rng.uniform(-40.0, 40.0).to_radians(); // 原地小转，方向缓变
                 let cand0 = (
@@ -1280,26 +1305,19 @@ fn build_road_inner(
                 p.gainTimeMs = start_ms + rec_t * 1000 + drift;
                 p.gainTime = super::geom::fmt_gain_time(p.gainTimeMs);
             }
-            // 后续时间轴均摊：毛刺段压缩省下的时间摊回后续间隔
-            // （真人末点 totalTime = dur 不变；毛刺后平均间隔 5.0 -> ~5.1s，
-            // 与真人 233 点均值 5.11s 的形态一致）
+            // 毛刺后时间轴重建为 **5.000s 钟摆网格**（盲测3 第一梯队指纹 6：
+            // 真人 10/16 条 ≥97.5% 的 gainTime 间隔恰好 +5.000s——设备定时器
+            // 打点；生成器的 4s/6s 拟人抖动反而是指纹）。毛刺压缩的时间直接
+            // 丢失（真人毛刺轨迹末点同样 < 点数×5s），总时长相应缩短。
             let shift = orig_span - 1;
-            let tail = locs.len() - 1 - (k1 + 1);
-            if shift > 0 && tail > 0 {
-                for k in (k1 + 1)..locs.len() {
-                    // 靠近毛刺段的点多扣，越靠后越接近原网格 -> 末点 totalTime
-                    // 恢复 = dur（真人毛刺轨迹末点 1207 = 点数×平均间隔不缩水）
-                    let give_back = shift * (k - (*e0 + 1)) as i64 / tail as i64;
-                    let drift = locs[k].gainTimeMs - (start_ms + old_ts[k] * 1000);
-                    locs[k].totalTime -= shift - give_back;
-                    // 恢复点后间隔 ≥4s：均摊首点被拉到 rec_t 以下会倒退
-                    // （floor 只对紧邻恢复点的前 3 个点有意义，避免无界抬升）
-                    let floor_t = rec_t + ((k - k1) as i64 * 4).min(12);
-                    locs[k].totalTime = locs[k].totalTime.max(floor_t);
-                    locs[k].validTime = locs[k].totalTime;
-                    locs[k].gainTimeMs = start_ms + locs[k].totalTime * 1000 + drift;
-                    locs[k].gainTime = super::geom::fmt_gain_time(locs[k].gainTimeMs);
-                }
+            let _ = shift;
+            for k in (k1 + 1)..locs.len() {
+                let grid_t = rec_t + (k - k1) as i64 * 5;
+                let drift = locs[k].gainTimeMs - (start_ms + old_ts[k] * 1000);
+                locs[k].totalTime = grid_t;
+                locs[k].validTime = grid_t;
+                locs[k].gainTimeMs = start_ms + grid_t * 1000 + drift;
+                locs[k].gainTime = super::geom::fmt_gain_time(locs[k].gainTimeMs);
             }
         }
         if let Some(last) = locs.last() {
@@ -1307,28 +1325,25 @@ fn build_road_inner(
         }
     }
 
-    // 真机 bdD = 当前移动方向（ forthcoming 位移方位, 含抖动）+ 轻噪声;
-    // 哨兵(首点/type5) bdD=0
+    // 真机 bdD = **已走过段**（prev→cur）的航向 + 定位噪声（盲测3 最优雅
+    // 指纹：生成按「当前→下一点」解析计算，航向指向未来段、与下一航段
+    // 中位误差 1.5°；真机带定位噪声、与上一段中位误差 5.22°、重尾
+    // 27-49%——与 ±2m/次的坐标噪声幅度定量吻合）。哨兵不清零。
     {
         let n_l = locs.len();
         for i in 0..n_l {
-            let (glat, glng) = (locs[i].gLat, locs[i].gLng);
-            let brg = if i + 1 < n_l {
-                let (glat2, glng2) = (locs[i + 1].gLat, locs[i + 1].gLng);
-                (((glng2 - glng) * 85_200.0)
-                    .atan2((glat2 - glat) * 111_132.0)
+            let brg = if i > 1 {
+                let (glat0, glng0) = (locs[i - 1].gLat, locs[i - 1].gLng);
+                let (glat, glng) = (locs[i].gLat, locs[i].gLng);
+                (((glng - glng0) * 85_200.0)
+                    .atan2((glat - glat0) * 111_132.0)
                     .to_degrees()
-                    + rng.uniform(-3.0, 3.0))
+                    + rng.uniform(-8.0, 8.0))
                 .rem_euclid(360.0)
             } else {
                 locs[i].bdD
             };
-            locs[i].bdD = round_to(brg, 1);
-        }
-        for k in [0usize, 1usize] {
-            if k < n_l {
-                locs[k].bdD = 0.0;
-            }
+            locs[i].bdD = round_to(brg, 2);
         }
     }
     // 设备语义：totalDis/avgSpeed 从最终坐标重新累计（真机管线一致）
@@ -1372,25 +1387,10 @@ fn build_road_inner(
             five_point_id_base: 1,
         };
         super::stats::rederive_from_coordinates(&mut tmp, &mut rng_rederive);
-        // 2km 停止语义: 坐标累计因路弯+抖动总是 > 路线规划距离，
-        // 统一重定标到真机 2km 停止窗口（真人 28/33 在 2000.1-2011.8m）
-        {
-            let target = if walk_dist > 2100.0 {
-                walk_dist + rng_rederive.uniform(0.1, 11.8) // 过冲跑: 自然长度
-            } else {
-                2000.0 + rng_rederive.uniform(0.1, 11.8) // 2km 停止
-            };
-            let cur = tmp.locations.last().unwrap().totalDis;
-            if cur > 0.0 && (cur - target).abs() > 0.5 {
-                let k = target / cur;
-                for p in tmp.locations.iter_mut() {
-                    p.totalDis *= k;
-                    p.validDis *= k;
-                }
-                tmp.totalDistance = tmp.locations.last().unwrap().totalDis;
-                tmp.validDistance = tmp.totalDistance;
-            }
-        }
+        // 重定标已废除（盲测3 指纹 5）：真人 totalDis/几何 = 1±float32
+        // 噪声，任何比例缩放都会破坏 validDis 增量与 f32(haversine) 的
+        // 位级血缘（自验命中率 0%）。2km 停止语义由几何预算保证：
+        // walk_dist = dist+25 ≥ dist → totalDis ≈ dist+10 ≥ 2000。
         total_dis = tmp.totalDistance;
         locs = tmp.locations;
     }
@@ -1628,7 +1628,12 @@ mod preview_tests {
             // Campus perimeter is 960 m; 5 km must reuse school roads.
             let track = build_road(5000.0, 2000, seed, 123000, &points, &points, &net).unwrap();
             assert!((track.totalDistance - 5000.0).abs() < 250.0);
-            assert_eq!(track.totalTime, 2000);
+            // 毛刺钟摆：总时长容许 ≤25s 压缩
+            assert!(
+                (1970..=2000).contains(&track.totalTime),
+                "tt={}",
+                track.totalTime
+            );
             track.validate_consistency().unwrap();
             assert!(track
                 .locations

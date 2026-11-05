@@ -83,11 +83,20 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
     for p in track.locations.iter_mut() {
         let (glat, glng) = crate::track::wire::bd09_to_gcj02(p.gLat, p.gLng);
         if let Some((pla, plo)) = prev {
-            // 局地欧氏（cos(lat) 修正）：真机 d(totalDis)/haversine 恒定
-            // （0.9989，R≈6364km 语义），途中可有缓慢漂移但无逐段噪声
-            let coslat = ((glat + pla) * 0.5).to_radians().cos();
-            let d = ((glat - pla) * 111_132.0).hypot((glng - plo) * 111_320.0 * coslat);
-            cum += d * 0.9989;
+            // 位级血缘（盲测3 第一梯队）：真机 App（Java）对相邻两点做
+            // haversine(R=6371000) 后以 float32 精度逐点累加——真机
+            // validDis 逐步增量与 float32(haversine) 命中率 98-99%，
+            // 独立生成的距离序列为 0%。1:1 复刻该累加管线。
+            let (la1, lo1, la2, lo2) = (
+                pla.to_radians(),
+                plo.to_radians(),
+                glat.to_radians(),
+                glng.to_radians(),
+            );
+            let h = ((la2 - la1) / 2.0).sin().powi(2)
+                + la1.cos() * la2.cos() * ((lo2 - lo1) / 2.0).sin().powi(2);
+            let d = 6_371_000.0 * 2.0 * h.sqrt().asin();
+            cum += (d as f32) as f64;
         }
         p.totalDis = cum;
         p.validDis = cum;
@@ -196,7 +205,9 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
         // 真人 radius 变化型只有 1-24 个取值（每值持续 8-30 点），
         // 逐点高斯会产生 200+ 唯一值 -> 块状重采样
         if wandering && i % radius_block == 0 {
-            rad_var = (rad_var + rng.gauss(0.0, 0.9)).clamp(3.0, 7.5);
+            // 步长加大+偏置防周期循环（盲测3：9 值精确周期/成块恒定是
+            // 生成指纹；真人差值 0.02-1.49 无规律）
+            rad_var = (rad_var + rng.gauss(0.0, 1.3) + rng.uniform(-0.4, 0.4)).clamp(3.0, 9.5);
         }
         p.radius = if cold_start && i < n_cold {
             // 真人冷启动收敛差值无规律（盲查 0.02-1.49）：指数收敛+随机抖动
@@ -240,33 +251,12 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
         track.locations[1].speed = 0.0;
         track.locations[1].bdS = 0.0;
     }
-    // 真机语义: totalDis 恒等于窗口距离之和（真机 segment/speed 管线和
-    // == totalDis, 比值 0.9998-1.0000）。按窗口距离和重定标各点累计。
-    let win_sum: f64 = track.speedPerTenSec.iter().map(|w| w.value).sum();
-    if win_sum > 1.0 {
-        let k = win_sum / cum;
-        for p in track.locations.iter_mut() {
-            p.totalDis *= k;
-            p.validDis *= k;
-        }
-    }
+    // 重定标已废除（盲测3 指纹 1/5）：任何比例缩放都会破坏 validDis
+    // 增量与 f32(haversine) 的位级血缘（全局常数 k 是「独立距离序列」
+    // 的直接证据）。2km 停止语义由几何预算保证（walk_dist = dist+25）。
     if let Some(last) = track.locations.last_mut() {
         track.totalDistance = last.totalDis;
         track.validDistance = last.validDis;
-    }
-    // 2km 停止语义: 坐标累计可能比路线规划长 10-15%（路弯+抖动），
-    // 统一重定标到真机 2km 停止窗口 [2000.1, 2011.8]
-    if let Some(last) = track.locations.last_mut() {
-        if last.totalDis > 1800.0 && last.totalDis < 2500.0 {
-            let target = 2000.0 + rng.uniform(0.1, 11.8);
-            let k = target / last.totalDis;
-            for p in track.locations.iter_mut() {
-                p.totalDis *= k;
-                p.validDis *= k;
-            }
-            track.totalDistance = track.locations.last().unwrap().totalDis;
-            track.validDistance = track.totalDistance;
-        }
     }
 }
 
@@ -314,35 +304,9 @@ pub fn rebuild(track: &mut Track) {
         *cum.last().unwrap_or(&0.0)
     };
     let mut previous = (0.0f64, 0.0f64);
-    // 窗链坐标差从 t0 起（与闭合基准一致；真人窗链亦不含 t0 前的启动段）
-    let mut prev_coord = coord_at(&track.locations, &coord_cum, t0 as f64 / 1000.0);
-    // 真人窗口/段距离和 ≈ 0.9956×totalDis（略少）——每跑常数因子
-    // 真人窗和/totalDis = 0.9956 [0.987, 1.000]（从不 >1）。几何 G 因
-    // 漂移弧/毛刺白扣而浮动 → 固定 factor 会越界；改为按全程坐标差
-    // 精确闭合：窗和 = ratio × totalDistance
-    let win_ratio =
-        super::geom::Rng::new(track.startTime as u64 ^ 0x5E_ED_5E_ED).uniform(0.9870, 0.9990);
-    let coord_span_total = coord_at(
-        &track.locations,
-        &coord_cum,
-        track.locations.last().map(|p| p.totalTime).unwrap_or(0) as f64,
-    ) - coord_at(&track.locations, &coord_cum, t0 as f64 / 1000.0);
-    // 闭合基准 = 末点 totalDis（真实坐标累计；totalDistance 字段在测试
-    // 合成轨迹里可能与 locations 脱节）
-    let closed_base = track.locations.last().map(|p| p.totalDis).unwrap_or(0.0);
-    let window_factor = if coord_span_total > 1.0 && closed_base > 1.0 {
-        win_ratio * closed_base / coord_span_total
-    } else {
-        1.0
-    };
-    // 段和略高于窗和 0.4%（真人 0.9992 vs 0.9956）
-    let seg_ratio =
-        super::geom::Rng::new(track.startTime as u64 ^ 0x5E_6_5E6).uniform(0.9930, 0.9995);
-    let seg_factor_total = if coord_span_total > 1.0 && closed_base > 1.0 {
-        seg_ratio * closed_base / coord_span_total
-    } else {
-        1.0
-    };
+    // 窗距离/段距离 = validDis 差分（与 speed_json/segment 位级同源）。
+    // 真人窗和/totalDis = 0.9956 [0.987, 1.000]，段和 0.9992——差分天然
+    // 落在该区间（毛刺冻结 + t0 启动段不在窗链内）。
     let mut prev_ms = t0;
     let mut prev_seg_s = 0i64;
     let flag_sec = ((track.startTime as f64) / 1000.0).floor() as i64;
@@ -351,11 +315,9 @@ pub fn rebuild(track: &mut Track) {
         13 + (super::geom::Rng::new(track.startTime as u64 ^ 0xF1_57).uniform(0.0, 5.0)) as i64;
     for &hi_ms in &boundaries {
         let current = counters_at_f64(&track.locations, hi_ms as f64 / 1000.0);
-        let coord_now = coord_at(&track.locations, &coord_cum, hi_ms as f64 / 1000.0);
-        // 真机窗口距离来自独立滤波流：与坐标折线相关但绝不逐点相等
-        // （真人 0/1256 窗与折线浮点相等），乘性偏差 ~1.5%
-        let distance = (coord_now - prev_coord) * window_factor;
-        prev_coord = coord_now;
+        // 真机 speed_json.distance = validDis 窗口差分（盲测3 第一梯队
+        // 指纹 2：位级相等率 43-93% vs 独立生成 0%）——与 steps 同源
+        let distance = current.0 - previous.0;
         let steps = current.1 - previous.1;
         track.speedPerTenSec.push(TenWindow {
             time: hi_ms - prev_ms,
@@ -380,12 +342,11 @@ pub fn rebuild(track: &mut Track) {
         }
         let seg_lo_s = prev_seg_s;
         let seg_dur_s = (seg_hi_s - seg_lo_s).max(1);
-        // 段和 = seg_ratio × totalDistance（精确闭合）
-        let seg_dist = (coord_at(&track.locations, &coord_cum, seg_hi_s as f64)
-            - coord_at(&track.locations, &coord_cum, seg_lo_s as f64))
-            * seg_factor_total;
+        // 真机 segment.distance = validDis 差分（盲测3：段和/totalDis
+        // = 0.9992，位级同源）
         let seg_cur = counters_at_f64(&track.locations, seg_hi_s as f64);
         let seg_prev = counters_at_f64(&track.locations, seg_lo_s as f64);
+        let seg_dist = seg_cur.0 - seg_prev.0;
         track.segments.push(Segment {
             totalTime: seg_dur_s,
             distance: seg_dist,
@@ -396,7 +357,8 @@ pub fn rebuild(track: &mut Track) {
             } else {
                 0.0
             },
-            avgStep: ((seg_cur.1 - seg_prev.1) * 60.0 / seg_dur_s as f64).round() as i64,
+            // 真人 avgStep ≡ 6 × stepsNum（97-99% 位级命中；App 端写死公式）
+            avgStep: ((seg_cur.1 - seg_prev.1).round() as i64) * 6,
             state: 0,
         });
         previous = current;

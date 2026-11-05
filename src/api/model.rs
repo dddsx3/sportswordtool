@@ -479,7 +479,9 @@ pub fn device_profile() -> DeviceProfile {
     let profile = DeviceProfile {
         // 7 位小数基准：f32 最短表示与真人 3.7900925 形态一致
         radius_base: ((3.5 + rng.gen::<f64>() * 4.5) * 1e7).round() / 1e7,
-        point_id: 11_000 + (rng.gen::<f64>() * 4_000.0) as i64,
+        // 真人同设备 DB 历史连贯（33 条库 id 终点≈16217）：新账号从
+        // 16250 起无缝衔接且不与真人区间碰撞（盲测3 指纹 15）
+        point_id: 16_250 + (rng.gen::<f64>() * 600.0) as i64,
         window_id: 4_000 + (rng.gen::<f64>() * 3_000.0) as i64,
         five_point_id: 340 + (rng.gen::<f64>() * 160.0) as i64,
     };
