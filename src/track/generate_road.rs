@@ -569,7 +569,8 @@ fn build_road_inner(
         .collect();
     let mut walk_stops: Vec<(usize, usize, Vec<i64>)> = Vec::new(); // (first, last, types)
     if n > 30 && rng.random() > 0.12 {
-        let n_stop = if rng.random() < 0.7 { 1 } else { 2 };
+        // 停顿窗前移 + 单段优先（盲测4 N9：毛刺靠后截断 gainTime 钟摆游程）
+    let n_stop = if rng.random() < 0.55 { 1 } else { 2 };
         let lo = (n as f64 * 0.15) as usize;
         let hi = (n as f64 * 0.88) as usize;
         for _ in 0..n_stop {
@@ -826,7 +827,7 @@ fn build_road_inner(
     // 真人海拔形态：缓爬缓降趋势（gain/std=13），AR 趋势项 phi 主导，
     // σ 决定窗口内抖动（真人 alt_std 1.8-9.2 中位 3.4、gain 44.7）
     let alt_phi = rng.uniform(0.95, 0.99);
-    let alt_sigma = rng.uniform(0.5, 1.6) * 0.9;
+    let alt_sigma = rng.uniform(0.5, 1.6) * 0.55;
     let alt_sink = rng.random() < 0.7;
     let alt_sink_m = rng.uniform(2.0, 15.0);
     // 卫星数：真机每跑 max 37-54（一个 80），劣 GPS episode 降到 0-8
@@ -1335,15 +1336,27 @@ fn build_road_inner(
             let brg = if i > 1 {
                 let (glat0, glng0) = (locs[i - 1].gLat, locs[i - 1].gLng);
                 let (glat, glng) = (locs[i].gLat, locs[i].gLng);
+                // 真机罗盘噪声中位 7.5-10.1°（盲测4 N5），5% 点大偏差
+                let n = if rng.random() < 0.05 {
+                    rng.uniform(-40.0, 40.0)
+                } else {
+                    rng.uniform(-10.0, 10.0)
+                };
                 (((glng - glng0) * 85_200.0)
                     .atan2((glat - glat0) * 111_132.0)
                     .to_degrees()
-                    + rng.uniform(-8.0, 8.0))
+                    + n)
                 .rem_euclid(360.0)
             } else {
                 locs[i].bdD
             };
-            locs[i].bdD = round_to(brg, 2);
+            // 精度混合（盲测4 N4：真人 2 位占比 0.35-0.44、整数值 18-41 个）
+            let dp = if rng.random() < 0.40 {
+                if rng.random() < 0.35 { 0 } else { 1 }
+            } else {
+                2
+            };
+            locs[i].bdD = round_to(brg, dp);
         }
     }
     // 设备语义：totalDis/avgSpeed 从最终坐标重新累计（真机管线一致）

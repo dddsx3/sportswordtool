@@ -157,9 +157,9 @@ pub fn rederive_from_coordinates(track: &mut Track, rng: &mut super::geom::Rng) 
             p.validDis = prev_d;
             // 真人毛刺 av 偏高段为主（0.3-0.8），av<0.15 稀少 -> 70/30 混合
             let av_raw = if rng.random() < 0.70 {
-                rng.uniform(0.30, 0.80)
+                rng.uniform(0.50, 0.80)
             } else {
-                rng.uniform(0.002, 0.30)
+                rng.uniform(0.10, 0.50)
             };
             p.avgSpeed = round_to(av_raw, 2);
             p.speed = if p.ptype == -1 {

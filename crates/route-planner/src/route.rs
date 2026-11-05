@@ -506,7 +506,7 @@ pub fn plan_loop(
             let seg = if future.is_empty() {
                 shortest_path(g, cur, t)
             } else {
-                let variant = leg_p.sample(&mut leg_rng) < 0.30;
+                let variant = leg_p.sample(&mut leg_rng) < 0.40;
                 let leg_scale = if variant {
                     leg_variant.sample(&mut leg_rng)
                 } else {
@@ -602,11 +602,16 @@ pub fn plan_loop(
                 } else {
                     0.0
                 };
+                use rand::Rng as _;
+                let anchor_swing = StdRng::seed_from_u64(
+                    seed.wrapping_add(0x5A_11_11).wrapping_add(i as u64 * 13),
+                )
+                .gen_range(-90.0..90.0_f64);
                 let (ext, walked) = wander_open(
                     g,
                     cur,
                     need,
-                    anchor_deg + back_pedal + i as f64 * 90.0,
+                    anchor_deg + back_pedal + anchor_swing + i as f64 * 90.0,
                     &mut rng,
                     opts,
                     &seed_used,

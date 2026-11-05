@@ -54,7 +54,8 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
         locs[0].validDis = 0.0;
         locs[0].steps = 0;
         locs[0].state = 1;
-        locs[0].ptype = rng.choice(&[0, 0, 0, 7]);
+        // 真人首条 type=7 仅 1/16（盲测4 N15）
+        locs[0].ptype = if rng.random() < 0.10 { 7 } else { 0 };
         locs[0].locType = 1;
         locs[0].radius = round_to(rng.uniform(1.5, 3.0), 2);
         for j in 1..locs.len() {
@@ -68,20 +69,19 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
             locs[0].speed = round_to(rng.uniform(7.0, 13.0), 4);
         }
     }
-    // 真机 gainTime 是打点时钟：漂移恒定，偶发 ±3-17s 校正
-    // （ΔgainTime ≡ ΔtotalTime 占 82-99%）
+    // 真机 gainTime 时钟形态（盲测4 N10）：首点 ≈ flag（-0.7~+0.2s），
+    // 全程中位偏移漂移到 2.4-4.5s（GPS fix 延迟的物理常数）——线性漂移
+    // 曲线 + 偶发 ±17s 修正；收尾不再缩半（真人收尾偏移保持）
     let n_pts = locs.len();
-    // 真人首点 gainTime-flag = -0.68~+0.16s：打点时钟起始即对齐 flag
+    let target_drift = rng.uniform(2.4, 4.5);
     let mut drift_s = rng.uniform(-0.6, 0.3);
     for (idx, p) in locs.iter_mut().enumerate() {
+        let base = target_drift * (idx as f64 / n_pts.max(1) as f64);
         if idx > 0 && rng.random() < 0.03 {
-            drift_s = (drift_s + rng.uniform(-17.0, 17.0)).clamp(0.0, 37.0);
+            drift_s = (drift_s + rng.uniform(-17.0, 17.0)).clamp(-1.0, 20.0);
         }
-        let remain = n_pts - idx;
-        if remain <= 3 {
-            drift_s *= 0.4;
-        }
-        p.gainTimeMs = start_ms + p.totalTime * 1000 + (drift_s * 1000.0) as i64;
+        let drift_eff = (base + drift_s).max(-0.8);
+        p.gainTimeMs = start_ms + p.totalTime * 1000 + (drift_eff * 1000.0) as i64;
         p.gainTime = super::geom::fmt_gain_time(p.gainTimeMs);
     }
 }

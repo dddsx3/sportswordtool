@@ -218,6 +218,10 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
     let mut sp = Vec::new();
     let mut stf = Vec::new();
     let mut lo_ms = track.window_t0_ms;
+    // 真人窗 gap 恒 0（endTime[i] == beginTime[i+1]）：链式拼接，首窗
+    // beginTime 秒对齐 + 恒定微偏移，之后严格链式（无负重叠）
+    let first_begin = start_ms + (lo_ms / 1000) * 1000 + (start_ms % 1000).min(15);
+    let mut prev_end_opt: Option<i64> = None;
     let mut cum_d = 0.0f64;
     let mut cum_s = 0.0f64;
     // 真机 3/33 文件的窗口带 state∈{1,2}（定位状态透传）
@@ -243,18 +247,15 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
         // （盲查实测：speed.qn 与 steps.qn 均为 0,1,2,... 步长 1）
         // 真机 beginTime 对齐绝对秒表（10s 定时器，盲测3 指纹 7：毫秒
         // 尾数集中度 0.37-1.00）——秒对齐 + 恒定微偏移 + 少数窗执行抖动
-        let begin_aligned = if win_jitter_rng.gen::<f64>() < 0.30 {
-            start_ms
-                + (lo / 1000) * 1000
-                + (start_ms % 1000).min(15)
-                + win_jitter_rng.gen_range(0..60)
-        } else {
-            start_ms + (lo / 1000) * 1000 + (start_ms % 1000).min(15)
-        };
+        let begin_aligned = prev_end_opt.unwrap_or(first_begin);
+        let end_aligned = begin_aligned + a.time;
+        prev_end_opt = Some(end_aligned);
+        // 真机 speed_json.distance 为 Java float（35-51% 可被 f32 精确表示）
+        let distance_f32 = (a.value as f32) as f64;
         sp.push(json!({
             "beginTime": begin_aligned,
-            "distance": a.value,
-            "endTime": begin_aligned + a.time,
+            "distance": distance_f32,
+            "endTime": end_aligned,
             "flag": start_ms,
             "id": id,
             "queueNum": k as i64,
@@ -265,7 +266,7 @@ pub(crate) fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value
         stf.push(json!({
             "avgDiff": 0.0,
             "beginTime": begin_aligned,
-            "endTime": begin_aligned + a.time,
+            "endTime": end_aligned,
             "flag": start_ms,
             "id": id,
             "maxDiff": 0.0,
@@ -361,7 +362,7 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
                 "distance": lap_d,
                 "duration": lap_t,
                 "elevationGain": gain - prev_gain,
-                "endAltAbs": altitude,
+                "endAltAbs": round_to(altitude, 2),
                 "endAltRel": altitude - alt0,
                 "flag": start_ms,
                 "id": lap_id_base + laps.len() as i64,
