@@ -495,7 +495,9 @@ pub fn plan_loop(
         // 放大的变体路径（A* 分叉，仍按序到达）。
         use rand_distr::{Distribution, Uniform};
         let mut leg_rng = StdRng::seed_from_u64(seed.wrapping_add(0x1E_55_1E_11));
-        let leg_variant = Uniform::new(1.08_f64, 1.28);
+        // 温和绕行（5-15%）：走另一条平行道路，视觉自然；
+        // 超过 +20% 会明显绕路（用户反馈「路线怪异」）
+        let leg_variant = Uniform::new(1.05_f64, 1.15);
         let leg_p = Uniform::new(0.0_f64, 1.0);
         let mut used_edges: std::collections::HashSet<usize> = Default::default();
         for (i, &t) in must_pass.iter().enumerate() {
@@ -506,7 +508,7 @@ pub fn plan_loop(
             let seg = if future.is_empty() {
                 shortest_path(g, cur, t)
             } else {
-                let variant = leg_p.sample(&mut leg_rng) < 0.40;
+                let variant = leg_p.sample(&mut leg_rng) < 0.30;
                 let leg_scale = if variant {
                     leg_variant.sample(&mut leg_rng)
                 } else {
@@ -590,28 +592,13 @@ pub fn plan_loop(
                 let mut rng = StdRng::seed_from_u64(
                     seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1)),
                 );
-                // 40% 概率反向起步（真人折返跑：主路双程重叠宽带）
-                let back_pedal = if rand::Rng::gen_range(
-                    &mut StdRng::seed_from_u64(
-                        seed.wrapping_add(0xBA_C1_1A7).wrapping_add(i as u64 * 7),
-                    ),
-                    0.0..1.0,
-                ) < 0.4
-                {
-                    180.0
-                } else {
-                    0.0
-                };
-                use rand::Rng as _;
-                let anchor_swing = StdRng::seed_from_u64(
-                    seed.wrapping_add(0x5A_11_11).wrapping_add(i as u64 * 13),
-                )
-                .gen_range(-90.0..90.0_f64);
+                // 方向只按 4 次重试的 90° 扇区轮换；不加人工折返/随机
+                // 摆动——后者会在地图上产生锯齿状来回折返（人工痕迹）
                 let (ext, walked) = wander_open(
                     g,
                     cur,
                     need,
-                    anchor_deg + back_pedal + anchor_swing + i as f64 * 90.0,
+                    anchor_deg + i as f64 * 90.0,
                     &mut rng,
                     opts,
                     &seed_used,

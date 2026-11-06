@@ -356,7 +356,9 @@ fn build_road_inner(
     let start_ms = start_ms + 13 + (rng.uniform(0.0, 974.0)) as i64;
     let dur_f = dur as f64;
     let avg_v = dist / dur_f;
-    let a_c_max = 2.5;
+    // 真机慢跑转向向心加速度 4-6 m/s²（2.5 时的小半径圆角会把速度 cap
+    // 到 1.3 m/s = 12'15"，产生配速曲线锯齿）
+    let a_c_max = 4.5;
     let mut required = route_bd.to_vec();
     for p in must_bd {
         if !required.contains(p) {
@@ -456,10 +458,13 @@ fn build_road_inner(
     // 开放路径保护：路线短于目标（补距偶发不足）时收缩打点距离防绕圈回卷
     // （报告里程由 rederive 重定标到 2km 停止窗口，几何偏差 <1%）；
     // 路线长于目标（按序串联超 2km）时走完全程 = 真实过冲跑形态。
+    // 1% 余量（此前 0.05%：sum(disp_of) 因 sprint ramp/arc_cost 计算
+    // 误差会略超 route.length_m，触发 ring_point_at 的 rem_euclid 回卷
+    // -> 坐标瞬间跳回起点，视觉上是一条横跨校园的长线）
     let walk_dist = if route.length_m >= walk_dist + 0.5 {
         walk_dist
     } else {
-        route.length_m * 0.9995
+        route.length_m * 0.99
     };
 
     let n_pts = route_bd.len().max(1);
@@ -489,8 +494,9 @@ fn build_road_inner(
     // 运动学速度剖面：OU 配速 + 弯道预判刹车 + 精确命中目标距离
     let kin = KinParams {
         a_c_max,
-        // 真人中段 avgSpeed CV 0.105：默认 σ0.06（稳态 CV≈0.23）过强
-        sigma: 0.045,
+        // 真人中段 avgSpeed CV 0.105、pace 相邻差中位 0.41：σ 0.015
+        // 让 OU 只占 0.19'/步，其余由 GPS 抖动（真实来源）贡献
+        sigma: 0.015,
         ..Default::default()
     };
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -509,7 +515,7 @@ fn build_road_inner(
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use rand_distr::{Distribution as _, Normal};
-    let wn_dist = Normal::new(0.0, 0.12).unwrap();
+    let wn_dist = Normal::new(0.0, 0.02).unwrap();
     let mut wn_rng = StdRng::seed_from_u64(seed.wrapping_add(0x8E_15_5E_5));
     let speeds: Vec<f64> = w.iter().map(|v| v + wn_dist.sample(&mut wn_rng)).collect();
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
@@ -570,7 +576,7 @@ fn build_road_inner(
     let mut walk_stops: Vec<(usize, usize, Vec<i64>)> = Vec::new(); // (first, last, types)
     if n > 30 && rng.random() > 0.12 {
         // 停顿窗前移 + 单段优先（盲测4 N9：毛刺靠后截断 gainTime 钟摆游程）
-    let n_stop = if rng.random() < 0.55 { 1 } else { 2 };
+        let n_stop = if rng.random() < 0.55 { 1 } else { 2 };
         let lo = (n as f64 * 0.15) as usize;
         let hi = (n as f64 * 0.88) as usize;
         for _ in 0..n_stop {
@@ -631,7 +637,9 @@ fn build_road_inner(
         };
         for _ in 0..n_arc {
             let k0 = 6 + (rng.uniform(0.0, (n - 42) as f64)) as usize;
-            let m = 3; // 3 点弧：sin 对称性使 Δoff 最大 (sin(π/2)-sin(π/4))A，角 <45°
+            // 单点尖刺（真机 GPS 跳变形态）：1 点偏移 10-20m 后立即
+            // 恢复。3 点平滑鼓包会在配速曲线上造成 30% 的连续跳变（锯齿）
+            let m = 1;
             if k0 + m + 2 >= n
                 || (0..=m).any(|j| stop_idx_range_contains(&walk_stops, k0 + j))
                 || drift_arcs
@@ -643,7 +651,10 @@ fn build_road_inner(
             {
                 continue;
             }
-            let amp = rng.uniform(30.0, 40.0);
+            // 单点尖刺幅度 10-20m：位移从 8.3m 变到 sqrt(8.3²+15²)=17m，
+            // impl_max ≈ 3.4 m/s = 12 km/h（真人 min 4.30 min/km 对应
+            // 3.9 m/s，尖刺上限与之同量级）
+            let amp = rng.uniform(10.0, 20.0);
             let left0 = rng.random() < 0.5;
             // 计划期围栏预检：用 route 路线坐标 + 法向偏移模拟弧点，
             // 双侧都出界的弧直接丢弃（arc_cost 不含它，位移预算闭合）
@@ -763,9 +774,19 @@ fn build_road_inner(
     for &i in &normal_idx {
         disp_of[i] = seg_dist[i] * (walk_eff / denom);
     }
+    // 快跑窗渐进 ramp（真人是逐渐加速再减速；2-3 点硬乘 mult 会让配速
+    // 曲线出现 2-3 min/km 的相邻跳变，视觉上是锯齿）
     for (a, b, mult) in &sprints {
-        for j in *a..=*b {
-            disp_of[j] *= mult;
+        let ramp = 3usize;
+        for j in (*a).saturating_sub(ramp)..=(*b + ramp).min(n - 1) {
+            let w = if j < *a {
+                (j - (a - ramp)) as f64 / ramp as f64
+            } else if j > *b {
+                ((b + ramp) - j) as f64 / ramp as f64
+            } else {
+                1.0
+            };
+            disp_of[j] *= 1.0 + (mult - 1.0) * w;
         }
     }
 
@@ -804,9 +825,12 @@ fn build_road_inner(
     // GPS 抖动：AR(1) 相关漂移为主，独立测量噪声极小。
     // 真机 App 存的轨迹是**滤波后**的：横向偏离是 50-200m 尺度的缓慢漂移，
     // 不是逐点锯齿。alpha=0.96（时间常数 ~25 采样） + sigma_meas=0.04。
-    // 真人渲染边缘有 1-2px 连续 GPS 摆动（盲查 RMS 0.89px ≈ 1.9m）：
-    // 相关漂移 σ 拉回可见量级；纵向速度起伏由 OU 配速承担，不受影响
-    let mut jitter = GpsJitter::new(0.96, rng.uniform(2.2, 3.2), 0.04);
+    // GpsJitter 的参数化是 ex = α·ex + σ·z（innovation = σ）：
+    //   - 稳态横向偏移 = σ/√(1-α²)
+    //   - 每步变化 = σ（直接进入逐点位移 → 配速曲线）
+    // 真机要求「缓慢漂移 2m 量级 + 逐点变化 0.2m」→ α=0.995, σ=0.20。
+    // 旧参数 α=0.96/σ=0.65 每步变化 0.65m，是配速锯齿的主因。
+    let mut jitter = GpsJitter::new(0.995, rng.uniform(0.14, 0.22), 0.04);
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut positions = Vec::with_capacity(n);
@@ -841,7 +865,9 @@ fn build_road_inner(
         let dt = dts[i];
         let (typ, lt) = kinds[i];
         t_acc += dt;
-        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
+        let ring_total = *arcs.last().unwrap_or(&1.0);
+        // 硬上限：绝不 rem_euclid 回卷（回卷 = 横跨校园的长直线）
+        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss.min(ring_total * 0.998));
         let mut d_step = 0.0f64;
         let px;
         let py;
@@ -1223,14 +1249,9 @@ fn build_road_inner(
             let mut pl = (locs[*s0].gLat, locs[*s0].gLng);
             let mut brg = rng.uniform(0.0, 360.0).to_radians();
             for (j, k) in (*s0 + 1..=*e0).enumerate() {
-                // 真人毛刺链步长双形态（盲测3：同秒点对 1-38.8m）：
-                // 微动 0-3m 与大突刺 5-20m 各半——后者是 k 波动
-                // （0.95-1.005）与轨迹「突刺」视觉的来源
-                let step = if rng.random() < 0.5 {
-                    rng.uniform(0.0, 3.0)
-                } else {
-                    rng.uniform(5.0, 20.0)
-                };
+                // 停走微动 0-3m（真人同秒点对多为重复定位/微动；5-20m
+                // 大突刺会在轨迹图上产生尖刺、在 speed 字段产生锯齿——回退）
+                let step = rng.uniform(0.0, 3.0);
                 brg += rng.uniform(-40.0, 40.0).to_radians(); // 原地小转，方向缓变
                 let cand0 = (
                     pl.0 + step * brg.cos() / 111_132.0,
@@ -1346,13 +1367,17 @@ fn build_road_inner(
                     .atan2((glat - glat0) * 111_132.0)
                     .to_degrees()
                     + n)
-                .rem_euclid(360.0)
+                    .rem_euclid(360.0)
             } else {
                 locs[i].bdD
             };
             // 精度混合（盲测4 N4：真人 2 位占比 0.35-0.44、整数值 18-41 个）
             let dp = if rng.random() < 0.40 {
-                if rng.random() < 0.35 { 0 } else { 1 }
+                if rng.random() < 0.35 {
+                    0
+                } else {
+                    1
+                }
             } else {
                 2
             };
